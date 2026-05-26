@@ -1,0 +1,6 @@
+#Test_01
+
+if (x=1)
+  say ("Hello") 
+else
+  exit
