@@ -1,0 +1,39 @@
+/*
+ * ESP32 (Classic) Funktionstest für MX1508-Treiber
+ * ------------------------------------------------
+ * Nutzt GPIO 16 und GPIO 17 zur sicheren Steuerung.
+ */
+
+const int motorPin1 = 16; // Geht an IN1 vom Treiber
+const int motorPin2 = 17; // Geht an IN2 vom Treiber
+
+const unsigned long pumpOnTime = 5000;  // 5 Sekunden an
+const unsigned long pumpOffTime = 5000; // 5 Sekunden aus
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000); 
+  
+  pinMode(motorPin1, OUTPUT);
+  pinMode(motorPin2, OUTPUT);
+
+  // Sicherer Startzustand
+  digitalWrite(motorPin1, LOW);
+  digitalWrite(motorPin2, LOW);
+
+  Serial.println("Klassischer ESP32 bereit. Starte Loop...");
+}
+
+void loop() {
+  // 1. Pumpe EINSCHALTEN
+  Serial.println("Status: Motor AN (5 Sekunden)");
+  digitalWrite(motorPin1, HIGH); 
+  digitalWrite(motorPin2, LOW);  
+  delay(pumpOnTime);                   
+
+  // 2. Pumpe AUSSCHALTEN
+  Serial.println("Status: Motor AUS (5 Sekunden)");
+  digitalWrite(motorPin1, LOW);  
+  digitalWrite(motorPin2, LOW);  
+  delay(pumpOffTime);                  
+}
