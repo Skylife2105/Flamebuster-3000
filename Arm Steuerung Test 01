@@ -1,0 +1,187 @@
+#include <SCServo.h>
+
+SMS_STS st;
+
+#define S_RXD 16
+#define S_TXD 17
+
+const int SERVO_COUNT = 4;
+const int servoIDs[SERVO_COUNT] = {1, 2, 3, 4};
+
+// Grenzbereiche
+const float minDeg[SERVO_COUNT] = {0,   100, 100, 90};
+const float maxDeg[SERVO_COUNT] = {360, 360, 335, 190};
+
+// aktuelle Positionen
+float servoDeg[SERVO_COUNT] = {270, 360, 170, 90};
+
+// Startposition
+const float startPos[SERVO_COUNT] = {270, 360, 170, 90};
+
+// Endposition
+const float endPos[SERVO_COUNT] = {180, 100, 335, 180};
+
+// Bewegungseinstellungen
+const int SPEED = 800;
+const int ACCEL = 30;
+
+// ST3215: 0–4095 entspricht ca. 0–360°
+int degToPos(float deg) {
+  deg = constrain(deg, 0, 360);
+  return (int)(deg * 4095.0 / 360.0);
+}
+
+float limitServoDeg(int index, float deg) {
+  return constrain(deg, minDeg[index], maxDeg[index]);
+}
+
+void writeServo(int index, float deg) {
+  deg = limitServoDeg(index, deg);
+  servoDeg[index] = deg;
+
+  int pos = degToPos(deg);
+  st.WritePosEx(servoIDs[index], pos, SPEED, ACCEL);
+
+  Serial.print("Servo ");
+  Serial.print(servoIDs[index]);
+  Serial.print(" -> ");
+  Serial.print(deg);
+  Serial.println(" Grad");
+}
+
+void applyFailsafe() {
+  // Servo 3 ist Index 2, Servo 4 ist Index 3
+  if (servoDeg[2] >= 300 && servoDeg[2] <= 335) {
+    if (servoDeg[3] != 180) {
+      Serial.println("Failsafe aktiv: Servo 3 im Kollisionsbereich, Servo 4 wird auf 180 Grad gesetzt.");
+      writeServo(3, 180);
+    }
+  }
+}
+
+void writeAllServos(const float targetPos[SERVO_COUNT]) {
+  float safeTarget[SERVO_COUNT];
+
+  for (int i = 0; i < SERVO_COUNT; i++) {
+    safeTarget[i] = limitServoDeg(i, targetPos[i]);
+  }
+
+  // Failsafe schon vor der Bewegung berücksichtigen
+  if (safeTarget[2] >= 300 && safeTarget[2] <= 335) {
+    safeTarget[3] = 180;
+  }
+
+  for (int i = 0; i < SERVO_COUNT; i++) {
+    servoDeg[i] = safeTarget[i];
+    st.WritePosEx(servoIDs[i], degToPos(safeTarget[i]), SPEED, ACCEL);
+  }
+
+  Serial.println("Alle Servos gesetzt:");
+  printStatus();
+}
+
+void printStatus() {
+  Serial.println();
+  for (int i = 0; i < SERVO_COUNT; i++) {
+    Serial.print("Servo ");
+    Serial.print(servoIDs[i]);
+    Serial.print(": ");
+    Serial.print(servoDeg[i]);
+    Serial.print(" Grad | Bereich ");
+    Serial.print(minDeg[i]);
+    Serial.print(" - ");
+    Serial.print(maxDeg[i]);
+    Serial.println(" Grad");
+  }
+  Serial.println();
+}
+
+void printHelp() {
+  Serial.println();
+  Serial.println("Befehle:");
+  Serial.println("start       -> Startposition anfahren");
+  Serial.println("ende        -> Endposition anfahren");
+  Serial.println("status      -> aktuelle Positionen anzeigen");
+  Serial.println("1 270       -> Servo 1 auf 270 Grad");
+  Serial.println("2 150       -> Servo 2 auf 150 Grad");
+  Serial.println("3 320       -> Servo 3 auf 320 Grad");
+  Serial.println("4 180       -> Servo 4 auf 180 Grad");
+  Serial.println();
+}
+
+void handleInput(String input) {
+  input.trim();
+  input.toLowerCase();
+
+  if (input.length() == 0) return;
+
+  if (input == "start") {
+    Serial.println("Startposition wird angefahren...");
+    writeAllServos(startPos);
+    return;
+  }
+
+  if (input == "ende") {
+    Serial.println("Endposition wird angefahren...");
+    writeAllServos(endPos);
+    return;
+  }
+
+  if (input == "status") {
+    printStatus();
+    return;
+  }
+
+  if (input == "help" || input == "hilfe") {
+    printHelp();
+    return;
+  }
+
+  int spaceIndex = input.indexOf(' ');
+  if (spaceIndex == -1) {
+    Serial.println("Ungueltiger Befehl. Beispiel: 3 320");
+    return;
+  }
+
+  int servoNum = input.substring(0, spaceIndex).toInt();
+  float targetDeg = input.substring(spaceIndex + 1).toFloat();
+
+  if (servoNum < 1 || servoNum > 4) {
+    Serial.println("Ungueltige Servo-Nummer. Erlaubt: 1 bis 4");
+    return;
+  }
+
+  int index = servoNum - 1;
+
+  // Failsafe: Servo 4 darf nicht bewegt werden, wenn Servo 3 im Bereich 300-335 ist
+  if (index == 3 && servoDeg[2] >= 300 && servoDeg[2] <= 335 && targetDeg != 180) {
+    Serial.println("Blockiert: Servo 3 ist im Kollisionsbereich. Servo 4 muss auf 180 Grad bleiben.");
+    writeServo(3, 180);
+    return;
+  }
+
+  writeServo(index, targetDeg);
+  applyFailsafe();
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  Serial1.begin(1000000, SERIAL_8N1, S_RXD, S_TXD);
+  st.pSerial = &Serial1;
+
+  delay(1000);
+
+  Serial.println("ST3215 Roboterarm Steuerung gestartet");
+  printHelp();
+
+  Serial.println("Fahre Startposition an...");
+  writeAllServos(startPos);
+}
+
+void loop() {
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    handleInput(input);
+  }
+}
