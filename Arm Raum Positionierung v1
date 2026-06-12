@@ -1,0 +1,308 @@
+#include <SCServo.h>
+
+SMS_STS st;
+
+// ESP32 -> Bus Servo Adapter
+#define S_RXD 16
+#define S_TXD 17
+
+const int SERVO_COUNT = 4;
+const int servoIDs[SERVO_COUNT] = {1, 2, 3, 4};
+
+// Servo-Grenzbereiche in Grad
+const float minDeg[SERVO_COUNT] = {0,   100, 100, 90};
+const float maxDeg[SERVO_COUNT] = {360, 720, 335, 190};
+
+// Mechanik in mm
+const float SHOULDER_FORWARD = 40.0;   // Servo 2 liegt 4 cm vor Servo 1
+const float BASE_TO_SHOULDER = 56.0;   // Servo 2 liegt 5,6 cm über Servo 1
+const float L1 = 169.0;                // Servo 2 -> Servo 3
+const float L2 = 128.0;                // Servo 3 -> Servo 4
+const float TOOL = 77.0;               // Servo 4 -> Kopfspitze
+
+// Bewegungseinstellungen
+const int SPEED = 800;
+const int ACCEL = 30;
+
+// Aktuelle Servo-Winkel
+float servoDeg[SERVO_COUNT] = {270, 360, 170, 90};
+
+// Feste Positionen
+const float startPos[SERVO_COUNT] = {270, 360, 170, 90};
+const float endPos[SERVO_COUNT]   = {180, 100, 335, 180};
+
+// Kalibrierung
+const float SERVO1_YAW_OFFSET = 180.0;
+
+// Servo 2: 3° Servo = 1° Gelenk
+// Gelenk 90° nach oben = Servo 360°
+const float SERVO2_OFFSET = 90.0;
+const float SERVO2_RATIO = 3.0;
+
+// Servo 3: Gerade ausgestreckt = 170°
+const float SERVO3_STRAIGHT = 170.0;
+
+// Servo 4: Kopf horizontal bei senkrechtem Arm = 90°
+const float SERVO4_OFFSET = 180.0;
+
+// Optionaler Korrekturwert für Kopf-Neigung.
+// Wenn Kopf zu weit nach oben zeigt, negativer Wert.
+// Achtung: bei 90° Minimum kann Servo 4 nicht weiter nach unten korrigieren.
+const float HEAD_LEVEL_OFFSET = 0.0;
+
+float radToDeg(float rad) {
+  return rad * 180.0 / PI;
+}
+
+float degToRad(float deg) {
+  return deg * PI / 180.0;
+}
+
+int servoDegToPos(int index, float deg) {
+  // Servo 2 darf rechnerisch bis 720°
+  // Dafür muss Servo 2 mechanisch/firmwareseitig Multi-Turn können.
+  // Normale 0-360° Servoposition entspricht 0-4095.
+  if (index == 1) {
+    return (int)(deg * 4095.0 / 360.0);
+  }
+
+  deg = constrain(deg, 0, 360);
+  return (int)(deg * 4095.0 / 360.0);
+}
+
+bool inRange(float value, float minV, float maxV) {
+  return value >= minV && value <= maxV;
+}
+
+void applyFailsafe(float &s3, float &s4) {
+  if (s3 >= 300 && s3 <= 335) {
+    s4 = 180;
+  }
+}
+
+void printAxisInfo() {
+  Serial.println("Orientierung: X = Vorne | Y = Hoehe | Z = Seite");
+}
+
+void printStatus() {
+  Serial.println();
+  for (int i = 0; i < SERVO_COUNT; i++) {
+    Serial.print("Servo ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.print(servoDeg[i]);
+    Serial.println(" Grad");
+  }
+  Serial.println();
+}
+
+void writeServoAngles(float s1, float s2, float s3, float s4) {
+  s1 = constrain(s1, minDeg[0], maxDeg[0]);
+  s2 = constrain(s2, minDeg[1], maxDeg[1]);
+  s3 = constrain(s3, minDeg[2], maxDeg[2]);
+  s4 = constrain(s4, minDeg[3], maxDeg[3]);
+
+  applyFailsafe(s3, s4);
+
+  servoDeg[0] = s1;
+  servoDeg[1] = s2;
+  servoDeg[2] = s3;
+  servoDeg[3] = s4;
+
+  st.WritePosEx(servoIDs[0], servoDegToPos(0, s1), SPEED, ACCEL);
+  st.WritePosEx(servoIDs[1], servoDegToPos(1, s2), SPEED, ACCEL);
+  st.WritePosEx(servoIDs[2], servoDegToPos(2, s3), SPEED, ACCEL);
+  st.WritePosEx(servoIDs[3], servoDegToPos(3, s4), SPEED, ACCEL);
+
+  Serial.println("Servos gesetzt:");
+  printStatus();
+}
+
+bool moveToXYZ(float x, float y, float z) {
+  float r = sqrt(x * x + z * z);
+
+  if (r < 1.0) {
+    Serial.println("Fehler: Ziel zu nah an der Basis.");
+    return false;
+  }
+
+  // Servo 1 / Basisdrehung
+  float yawDeg = radToDeg(atan2(z, x));
+  float servo1 = SERVO1_YAW_OFFSET + yawDeg;
+
+  if (servo1 < 0) servo1 += 360;
+  if (servo1 > 360) servo1 -= 360;
+
+  // Ziel der Handgelenkachse berechnen
+  // Ursprung ist Servo 1.
+  // Servo 2 sitzt 40 mm weiter vorne und 56 mm hoeher.
+  // Kopf soll horizontal bleiben, daher TOOL in X/R-Richtung abziehen.
+  float wristR = r - SHOULDER_FORWARD - TOOL;
+  float wristY = y - BASE_TO_SHOULDER;
+
+  if (wristR < 0) {
+    Serial.println("Fehler: Ziel liegt zu nah an der Basis.");
+    return false;
+  }
+
+  float d = sqrt(wristR * wristR + wristY * wristY);
+
+  if (d > (L1 + L2)) {
+    Serial.println("Fehler: Ziel ist zu weit entfernt.");
+    return false;
+  }
+
+  if (d < abs(L1 - L2)) {
+    Serial.println("Fehler: Ziel ist zu nah am Arm.");
+    return false;
+  }
+
+  // 2D-Inverse-Kinematik
+  float cosElbow = (wristR * wristR + wristY * wristY - L1 * L1 - L2 * L2) / (2.0 * L1 * L2);
+  cosElbow = constrain(cosElbow, -1.0, 1.0);
+
+  // Ellenbogen nach vorne/unten
+  float elbowRad = -acos(cosElbow);
+
+  float shoulderRad = atan2(wristY, wristR) -
+                      atan2(L2 * sin(elbowRad), L1 + L2 * cos(elbowRad));
+
+  float shoulderDeg = radToDeg(shoulderRad);
+  float elbowDeg = radToDeg(elbowRad);
+
+  float forearmAbsDeg = shoulderDeg + elbowDeg;
+
+  // Gelenkwinkel -> Servo-Winkel
+  float servo2 = SERVO2_OFFSET + SERVO2_RATIO * shoulderDeg;
+  float servo3 = SERVO3_STRAIGHT - elbowDeg;
+
+  // Servo 4 hält Kopf möglichst horizontal
+  float servo4 = SERVO4_OFFSET - forearmAbsDeg + HEAD_LEVEL_OFFSET;
+
+  // Servo 4 niemals über mechanische Grenzen
+  servo4 = constrain(servo4, minDeg[3], maxDeg[3]);
+
+  applyFailsafe(servo3, servo4);
+
+  if (!inRange(servo1, minDeg[0], maxDeg[0])) {
+    Serial.print("Fehler, Servo 1 ausserhalb des Grenzbereichs: ");
+    Serial.println(servo1);
+    return false;
+  }
+
+  if (!inRange(servo2, minDeg[1], maxDeg[1])) {
+    Serial.print("Fehler, Servo 2 ausserhalb des Grenzbereichs: ");
+    Serial.println(servo2);
+    return false;
+  }
+
+  if (!inRange(servo3, minDeg[2], maxDeg[2])) {
+    Serial.print("Fehler, Servo 3 ausserhalb des Grenzbereichs: ");
+    Serial.println(servo3);
+    return false;
+  }
+
+  if (!inRange(servo4, minDeg[3], maxDeg[3])) {
+    Serial.print("Fehler, Servo 4 ausserhalb des Grenzbereichs: ");
+    Serial.println(servo4);
+    return false;
+  }
+
+  Serial.println();
+  Serial.println("Berechnete Werte:");
+  Serial.print("Yaw: "); Serial.println(yawDeg);
+  Serial.print("Schulter-Gelenk: "); Serial.println(shoulderDeg);
+  Serial.print("Ellenbogen-Gelenk: "); Serial.println(elbowDeg);
+  Serial.print("Unterarm absolut: "); Serial.println(forearmAbsDeg);
+  Serial.print("WristR: "); Serial.println(wristR);
+  Serial.print("WristY: "); Serial.println(wristY);
+  Serial.println();
+
+  writeServoAngles(servo1, servo2, servo3, servo4);
+  return true;
+}
+
+void printHelp() {
+  Serial.println();
+  Serial.println("Befehle:");
+  Serial.println("start           -> Startposition");
+  Serial.println("ende            -> Endposition");
+  Serial.println("status          -> aktuelle Servo-Winkel");
+  Serial.println("117 353 0       -> senkrechte Startposition");
+  Serial.println("150 200 100     -> XYZ-Zielposition");
+  Serial.println();
+  Serial.println("Koordinatensystem:");
+  Serial.println("Ursprung = Mitte Servo 1");
+  Serial.println("X = nach vorne");
+  Serial.println("Y = nach oben");
+  Serial.println("Z = nach rechts");
+  Serial.println();
+}
+
+void handleInput(String input) {
+  input.trim();
+  input.toLowerCase();
+
+  if (input.length() == 0) return;
+
+  if (input == "start") {
+    Serial.println("Fahre Startposition...");
+    writeServoAngles(startPos[0], startPos[1], startPos[2], startPos[3]);
+    return;
+  }
+
+  if (input == "ende") {
+    Serial.println("Fahre Endposition...");
+    writeServoAngles(endPos[0], endPos[1], endPos[2], endPos[3]);
+    return;
+  }
+
+  if (input == "status") {
+    printStatus();
+    return;
+  }
+
+  if (input == "help" || input == "hilfe") {
+    printHelp();
+    return;
+  }
+
+  float x, y, z;
+  int parsed = sscanf(input.c_str(), "%f %f %f", &x, &y, &z);
+
+  if (parsed == 3) {
+    Serial.print("Fahre zu X=");
+    Serial.print(x);
+    Serial.print(" Y=");
+    Serial.print(y);
+    Serial.print(" Z=");
+    Serial.println(z);
+
+    moveToXYZ(x, y, z);
+  } else {
+    Serial.println("Ungueltige Eingabe. Beispiel: 150 200 100");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setTimeout(50);
+
+  Serial1.begin(1000000, SERIAL_8N1, S_RXD, S_TXD);
+  st.pSerial = &Serial1;
+
+  delay(1000);
+
+  Serial.println("ST3215 XYZ-Roboterarmsteuerung gestartet");
+  printHelp();
+
+  Serial.println("Fahre Startposition...");
+  writeServoAngles(startPos[0], startPos[1], startPos[2], startPos[3]);
+}
+
+void loop() {
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    handleInput(input);
+  }
+}
