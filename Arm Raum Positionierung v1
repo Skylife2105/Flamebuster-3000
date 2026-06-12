@@ -58,6 +58,10 @@ float degToRad(float deg) {
   return deg * PI / 180.0;
 }
 
+void printAxisInfo() {
+  Serial.println("Orientierung: X = Vorne | Y = Hoehe | Z = Seite");
+}
+
 int servoDegToPos(int index, float deg) {
   // Servo 2 darf rechnerisch bis 720°
   // Dafür muss Servo 2 mechanisch/firmwareseitig Multi-Turn können.
@@ -78,10 +82,6 @@ void applyFailsafe(float &s3, float &s4) {
   if (s3 >= 300 && s3 <= 335) {
     s4 = 180;
   }
-}
-
-void printAxisInfo() {
-  Serial.println("Orientierung: X = Vorne | Y = Hoehe | Z = Seite");
 }
 
 void printStatus() {
@@ -116,6 +116,7 @@ void writeServoAngles(float s1, float s2, float s3, float s4) {
 
   Serial.println("Servos gesetzt:");
   printStatus();
+  printAxisInfo();
 }
 
 bool moveToXYZ(float x, float y, float z) {
@@ -219,6 +220,7 @@ bool moveToXYZ(float x, float y, float z) {
   Serial.println();
 
   writeServoAngles(servo1, servo2, servo3, servo4);
+ 
   return true;
 }
 
@@ -235,7 +237,7 @@ void printHelp() {
   Serial.println("Ursprung = Mitte Servo 1");
   Serial.println("X = nach vorne");
   Serial.println("Y = nach oben");
-  Serial.println("Z = nach rechts");
+  Serial.println("Z = zur Seite");
   Serial.println();
 }
 
