@@ -1,0 +1,549 @@
+#include <SCServo.h>
+#include <Preferences.h>
+
+SMS_STS st;
+Preferences prefs;
+
+#define S_RXD 16
+#define S_TXD 17
+
+const int SERVO_COUNT = 4;
+const int POSITION_COUNT = 10;
+const int ROUTINE_COUNT = 5;
+const int ROUTINE_STEPS = 10;
+
+const int servoIDs[SERVO_COUNT] = {1, 2, 3, 4};
+
+const float minDeg[SERVO_COUNT] = {0,   100, 100, 90};
+const float maxDeg[SERVO_COUNT] = {360, 720, 335, 270};
+
+const int SPEED = 800;
+const int ACCEL = 30;
+
+float servoDeg[SERVO_COUNT] = {270, 360, 170, 90};
+
+const float startPos[SERVO_COUNT] = {180, 100, 335, 180};
+const float endPos[SERVO_COUNT]   = {270, 360, 170, 90};
+
+struct SavedPosition {
+  bool used;
+  float deg[SERVO_COUNT];
+};
+
+struct RoutineStep {
+  bool used;
+  int posIndex;
+  unsigned long waitMs;
+};
+
+SavedPosition savedPositions[POSITION_COUNT];
+RoutineStep routines[ROUTINE_COUNT][ROUTINE_STEPS];
+
+int servoDegToPos(int servoIndex, float deg) {
+  if (servoIndex == 1) {
+    return (int)(deg * 4095.0 / 360.0);
+  }
+
+  return (int)(deg * 4095.0 / 360.0);
+}
+
+bool angleValid(int servoIndex, float deg) {
+  return deg >= minDeg[servoIndex] && deg <= maxDeg[servoIndex];
+}
+
+bool allAnglesValid(float values[]) {
+  for (int i = 0; i < SERVO_COUNT; i++) {
+    if (!angleValid(i, values[i])) return false;
+  }
+  return true;
+}
+
+void applyFailsafe(float values[]) {
+  if (values[2] >= 300 && values[2] <= 335) {
+    values[3] = 170;
+  }
+}
+
+void saveData() {
+  prefs.putBytes("positions", savedPositions, sizeof(savedPositions));
+  prefs.putBytes("routines", routines, sizeof(routines));
+}
+
+void loadData() {
+  memset(savedPositions, 0, sizeof(savedPositions));
+  memset(routines, 0, sizeof(routines));
+
+  if (prefs.getBytesLength("positions") == sizeof(savedPositions)) {
+    prefs.getBytes("positions", savedPositions, sizeof(savedPositions));
+  }
+
+  if (prefs.getBytesLength("routines") == sizeof(routines)) {
+    prefs.getBytes("routines", routines, sizeof(routines));
+  }
+}
+
+void printStatus() {
+  Serial.println();
+  Serial.println("Aktuelle Armstellung:");
+
+  for (int i = 0; i < SERVO_COUNT; i++) {
+    Serial.print("Servo ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.print(servoDeg[i]);
+    Serial.println(" Grad");
+  }
+
+  Serial.println();
+}
+
+void moveArmTo(float values[]) {
+  applyFailsafe(values);
+
+  if (!allAnglesValid(values)) {
+    Serial.println("Fehler: Mindestens ein Servo liegt ausserhalb der erlaubten Grenzen.");
+    return;
+  }
+
+  for (int i = 0; i < SERVO_COUNT; i++) {
+    servoDeg[i] = values[i];
+    st.WritePosEx(servoIDs[i], servoDegToPos(i, servoDeg[i]), SPEED, ACCEL);
+  }
+
+  printStatus();
+}
+
+void moveSingleServo(int servoNumber, float deg) {
+  if (servoNumber < 1 || servoNumber > SERVO_COUNT) {
+    Serial.println("Fehler: Servo muss 1 bis 4 sein.");
+    return;
+  }
+
+  int index = servoNumber - 1;
+
+  if (!angleValid(index, deg)) {
+    Serial.print("Fehler: Servo ");
+    Serial.print(servoNumber);
+    Serial.print(" erlaubt nur ");
+    Serial.print(minDeg[index]);
+    Serial.print(" bis ");
+    Serial.print(maxDeg[index]);
+    Serial.println(" Grad.");
+    return;
+  }
+
+  float target[SERVO_COUNT];
+
+  for (int i = 0; i < SERVO_COUNT; i++) {
+    target[i] = servoDeg[i];
+  }
+
+  target[index] = deg;
+  moveArmTo(target);
+}
+
+void savePositionAuto() {
+  for (int i = 0; i < POSITION_COUNT; i++) {
+    if (!savedPositions[i].used) {
+      savedPositions[i].used = true;
+
+      for (int s = 0; s < SERVO_COUNT; s++) {
+        savedPositions[i].deg[s] = servoDeg[s];
+      }
+
+      saveData();
+
+      Serial.print("Armstellung gespeichert als Position ");
+      Serial.println(i + 1);
+      return;
+    }
+  }
+
+  Serial.println("Fehler: Positionstabelle ist voll.");
+}
+
+void savePositionToSlot(int slot) {
+  if (slot < 1 || slot > POSITION_COUNT) {
+    Serial.println("Fehler: Position muss 1 bis 10 sein.");
+    return;
+  }
+
+  int index = slot - 1;
+  savedPositions[index].used = true;
+
+  for (int i = 0; i < SERVO_COUNT; i++) {
+    savedPositions[index].deg[i] = servoDeg[i];
+  }
+
+  saveData();
+
+  Serial.print("Armstellung gespeichert auf Position ");
+  Serial.println(slot);
+}
+
+void gotoPosition(int slot) {
+  if (slot < 1 || slot > POSITION_COUNT) {
+    Serial.println("Fehler: Position muss 1 bis 10 sein.");
+    return;
+  }
+
+  int index = slot - 1;
+
+  if (!savedPositions[index].used) {
+    Serial.println("Fehler: Diese Position ist leer.");
+    return;
+  }
+
+  Serial.print("Fahre Position ");
+  Serial.println(slot);
+
+  moveArmTo(savedPositions[index].deg);
+}
+
+void clearPosition(int slot) {
+  if (slot < 1 || slot > POSITION_COUNT) {
+    Serial.println("Fehler: Position muss 1 bis 10 sein.");
+    return;
+  }
+
+  savedPositions[slot - 1].used = false;
+  saveData();
+
+  Serial.print("Position ");
+  Serial.print(slot);
+  Serial.println(" geloescht.");
+}
+
+void listPositions() {
+  Serial.println();
+  Serial.println("Gespeicherte Positionen:");
+  Serial.println("Nr | Servo1 | Servo2 | Servo3 | Servo4");
+
+  for (int i = 0; i < POSITION_COUNT; i++) {
+    Serial.print(i + 1);
+    Serial.print("  | ");
+
+    if (!savedPositions[i].used) {
+      Serial.println("leer");
+    } else {
+      for (int s = 0; s < SERVO_COUNT; s++) {
+        Serial.print(savedPositions[i].deg[s]);
+        if (s < SERVO_COUNT - 1) Serial.print(" | ");
+      }
+      Serial.println();
+    }
+  }
+
+  Serial.println();
+}
+
+void setRoutineStep(int routine, int step, int posSlot, unsigned long waitMs) {
+  if (routine < 1 || routine > ROUTINE_COUNT) {
+    Serial.println("Fehler: Routine muss 1 bis 5 sein.");
+    return;
+  }
+
+  if (step < 1 || step > ROUTINE_STEPS) {
+    Serial.println("Fehler: Schritt muss 1 bis 10 sein.");
+    return;
+  }
+
+  if (posSlot < 1 || posSlot > POSITION_COUNT || !savedPositions[posSlot - 1].used) {
+    Serial.println("Fehler: Position ist ungueltig oder leer.");
+    return;
+  }
+
+  routines[routine - 1][step - 1].used = true;
+  routines[routine - 1][step - 1].posIndex = posSlot - 1;
+  routines[routine - 1][step - 1].waitMs = waitMs;
+
+  saveData();
+
+  Serial.print("Routine ");
+  Serial.print(routine);
+  Serial.print(", Schritt ");
+  Serial.print(step);
+  Serial.println(" gespeichert.");
+}
+
+void clearRoutine(int routine) {
+  if (routine < 1 || routine > ROUTINE_COUNT) {
+    Serial.println("Fehler: Routine muss 1 bis 5 sein.");
+    return;
+  }
+
+  for (int i = 0; i < ROUTINE_STEPS; i++) {
+    routines[routine - 1][i].used = false;
+  }
+
+  saveData();
+
+  Serial.print("Routine ");
+  Serial.print(routine);
+  Serial.println(" geloescht.");
+}
+
+void listRoutine(int routine) {
+  if (routine < 1 || routine > ROUTINE_COUNT) {
+    Serial.println("Fehler: Routine muss 1 bis 5 sein.");
+    return;
+  }
+
+  Serial.println();
+  Serial.print("Routine ");
+  Serial.println(routine);
+  Serial.println("Schritt | Position | Pause ms");
+
+  bool empty = true;
+
+  for (int i = 0; i < ROUTINE_STEPS; i++) {
+    if (routines[routine - 1][i].used) {
+      empty = false;
+
+      Serial.print(i + 1);
+      Serial.print("       | ");
+      Serial.print(routines[routine - 1][i].posIndex + 1);
+      Serial.print("        | ");
+      Serial.println(routines[routine - 1][i].waitMs);
+    }
+  }
+
+  if (empty) Serial.println("leer");
+
+  Serial.println();
+}
+
+void listAllRoutines() {
+  for (int i = 1; i <= ROUTINE_COUNT; i++) {
+    listRoutine(i);
+  }
+}
+
+void showAll() {
+  Serial.println();
+  Serial.println("===== ALLE POSITIONEN UND ROUTINEN =====");
+  listPositions();
+  listAllRoutines();
+  Serial.println("===== ENDE =====");
+  Serial.println();
+}
+
+void playRoutine(int routine) {
+  if (routine < 1 || routine > ROUTINE_COUNT) {
+    Serial.println("Fehler: Routine muss 1 bis 5 sein.");
+    return;
+  }
+
+  Serial.print("Starte Routine ");
+  Serial.println(routine);
+
+  for (int i = 0; i < ROUTINE_STEPS; i++) {
+    if (!routines[routine - 1][i].used) continue;
+
+    int posIndex = routines[routine - 1][i].posIndex;
+
+    if (!savedPositions[posIndex].used) {
+      Serial.println("Fehler: Eine Position in der Routine ist leer.");
+      return;
+    }
+
+    Serial.print("Schritt ");
+    Serial.print(i + 1);
+    Serial.print(" -> Position ");
+    Serial.println(posIndex + 1);
+
+    moveArmTo(savedPositions[posIndex].deg);
+    delay(routines[routine - 1][i].waitMs);
+  }
+
+  Serial.println("Routine beendet.");
+}
+
+int splitInput(String input, String parts[], int maxParts) {
+  int count = 0;
+  input.trim();
+
+  while (input.length() > 0 && count < maxParts) {
+    int spaceIndex = input.indexOf(' ');
+
+    if (spaceIndex == -1) {
+      parts[count++] = input;
+      break;
+    }
+
+    parts[count++] = input.substring(0, spaceIndex);
+    input = input.substring(spaceIndex + 1);
+    input.trim();
+  }
+
+  return count;
+}
+
+void printHelp() {
+  Serial.println();
+  Serial.println("Befehle:");
+  Serial.println("s1 270                   -> Servo 1 einstellen");
+  Serial.println("s2 360                   -> Servo 2 einstellen");
+  Serial.println("s3 170                   -> Servo 3 einstellen");
+  Serial.println("s4 120                   -> Servo 4 einstellen");
+  Serial.println("servo 1 270              -> Servo einstellen");
+  Serial.println("pos save                 -> aktuelle Armstellung speichern");
+  Serial.println("pos save 3               -> aktuelle Armstellung auf Position 3 speichern");
+  Serial.println("pos goto 3               -> Position 3 anfahren");
+  Serial.println("pos list                 -> Positionen anzeigen");
+  Serial.println("pos clear 3              -> Position 3 loeschen");
+  Serial.println("routine set 1 1 3 2000   -> Routine 1, Schritt 1, Position 3, Pause 2000 ms");
+  Serial.println("routine play 1           -> Routine starten");
+  Serial.println("routine list 1           -> Routine anzeigen");
+  Serial.println("routine list all         -> alle Routinen anzeigen");
+  Serial.println("routine clear 1          -> Routine loeschen");
+  Serial.println("show all                 -> alles anzeigen");
+  Serial.println("status                   -> aktuelle Armstellung anzeigen");
+  Serial.println("start                    -> Startposition");
+  Serial.println("ende                     -> Endposition");
+  Serial.println();
+}
+
+void handleInput(String input) {
+  input.trim();
+  input.toLowerCase();
+
+  if (input.length() == 0) return;
+
+  String parts[6];
+  int count = splitInput(input, parts, 6);
+
+  if (input == "help" || input == "hilfe") {
+    printHelp();
+    return;
+  }
+
+  if (input == "status") {
+    printStatus();
+    return;
+  }
+
+  if (input == "show all") {
+    showAll();
+    return;
+  }
+
+  if (input == "start") {
+    float target[SERVO_COUNT] = {startPos[0], startPos[1], startPos[2], startPos[3]};
+    moveArmTo(target);
+    return;
+  }
+
+  if (input == "ende") {
+    float target[SERVO_COUNT] = {endPos[0], endPos[1], endPos[2], endPos[3]};
+    moveArmTo(target);
+    return;
+  }
+
+  if (count == 2 && parts[0] == "s1") {
+    moveSingleServo(1, parts[1].toFloat());
+    return;
+  }
+
+  if (count == 2 && parts[0] == "s2") {
+    moveSingleServo(2, parts[1].toFloat());
+    return;
+  }
+
+  if (count == 2 && parts[0] == "s3") {
+    moveSingleServo(3, parts[1].toFloat());
+    return;
+  }
+
+  if (count == 2 && parts[0] == "s4") {
+    moveSingleServo(4, parts[1].toFloat());
+    return;
+  }
+
+  if (count == 3 && parts[0] == "servo") {
+    moveSingleServo(parts[1].toInt(), parts[2].toFloat());
+    return;
+  }
+
+  if (count >= 2 && parts[0] == "pos") {
+    if (parts[1] == "save" && count == 2) {
+      savePositionAuto();
+      return;
+    }
+
+    if (parts[1] == "save" && count == 3) {
+      savePositionToSlot(parts[2].toInt());
+      return;
+    }
+
+    if (parts[1] == "goto" && count == 3) {
+      gotoPosition(parts[2].toInt());
+      return;
+    }
+
+    if (parts[1] == "list") {
+      listPositions();
+      return;
+    }
+
+    if (parts[1] == "clear" && count == 3) {
+      clearPosition(parts[2].toInt());
+      return;
+    }
+  }
+
+  if (count >= 2 && parts[0] == "routine") {
+    if (parts[1] == "set" && count == 6) {
+      setRoutineStep(parts[2].toInt(), parts[3].toInt(), parts[4].toInt(), parts[5].toInt());
+      return;
+    }
+
+    if (parts[1] == "play" && count == 3) {
+      playRoutine(parts[2].toInt());
+      return;
+    }
+
+    if (parts[1] == "list" && count == 3 && parts[2] == "all") {
+      listAllRoutines();
+      return;
+    }
+
+    if (parts[1] == "list" && count == 3) {
+      listRoutine(parts[2].toInt());
+      return;
+    }
+
+    if (parts[1] == "clear" && count == 3) {
+      clearRoutine(parts[2].toInt());
+      return;
+    }
+  }
+
+  Serial.println("Ungueltiger Befehl. Tippe help.");
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setTimeout(50);
+
+  Serial1.begin(1000000, SERIAL_8N1, S_RXD, S_TXD);
+  st.pSerial = &Serial1;
+
+  prefs.begin("robotarm", false);
+  loadData();
+
+  delay(1000);
+
+  Serial.println("Roboterarm bereit.");
+  printHelp();
+
+  float target[SERVO_COUNT] = {startPos[0], startPos[1], startPos[2], startPos[3]};
+  moveArmTo(target);
+}
+
+void loop() {
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    handleInput(input);
+  }
+}
