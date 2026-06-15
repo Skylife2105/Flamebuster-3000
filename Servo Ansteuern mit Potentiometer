@@ -8,130 +8,267 @@ Preferences prefs;
 // ---------- Anpassen ----------
 constexpr uint8_t SERVO_ID = 2;
 
-constexpr int SERVO_RX = 18;   // ESP32S3 RX-Pin zum Adapter
-constexpr int SERVO_TX = 17;   // ESP32S3 TX-Pin zum Adapter
-constexpr int POT_PIN  = 4;    // ADC-Pin vom Potentiometer-Schleifer
+constexpr int SERVO_RX = 18;
+constexpr int SERVO_TX = 17;
+constexpr int POT_PIN  = 4;
 
 constexpr int SERVO_BAUD = 1000000;
 
-// Mechanik
-constexpr float GEAR_RATIO = 3.0f;              // 3 Servo-Umdrehungen = 1 Gelenk-Umdrehung
-constexpr int32_t SERVO_STEPS_PER_REV = 4096;
-constexpr float JOINT_DEFAULT_MIN_DEG = 0.0f;
-constexpr float JOINT_DEFAULT_MAX_DEG = 150.0f;
+constexpr uint32_t SPEED_COMMAND_INTERVAL_MS = 50;
+constexpr int SPEED_CHANGE_THRESHOLD = 10;
 
-// Bewegung
-constexpr int DEFAULT_SPEED = 900;
-constexpr int DEFAULT_ACC = 30;
-constexpr float TARGET_TOLERANCE_DEG = 0.20f;   // Genauigkeit beim Anfahren
-constexpr float MAX_SINGLE_MOVE_DEG = 20.0f;    // Sicherheitslimit pro Kommando
-// ------------------------------
+int lastPhysicalSpeedCommand = 99999;
+uint32_t lastSpeedCommandMs = 0;
 
+// Kalibrierung
 int potMinRaw = 500;
 int potMaxRaw = 3500;
-float jointMinDeg = JOINT_DEFAULT_MIN_DEG;
-float jointMaxDeg = JOINT_DEFAULT_MAX_DEG;
+float jointMinDeg = 0.0f;
+float jointMaxDeg = 150.0f;
 
-float currentTargetDeg = 0.0f;
+// Regler
+float kp = 18.0f;
+int minSpeed = 35;
+int maxSpeed = 500;
+int activeAcc = 8;
+float toleranceDeg = 0.35f;
+
+// Sicherheit
+constexpr float HARD_MARGIN_DEG = 0.4f;
+constexpr float LIMIT_STOP_MARGIN_DEG = 0.8f;
+constexpr uint32_t CONTROL_INTERVAL_MS = 5;
+constexpr uint32_t MOVE_TIMEOUT_MS = 20000;
+
+// Wenn Richtung falsch ist: per Terminal "dir -1"
+int servoDirection = 1;
 
 String inputLine;
+String motionInputLine;
+bool emergencyLatched = false;
 
-int readPotRawAveraged(uint16_t samples = 64) {
+// ---------- Poti ----------
+
+int readPotRawAveraged(uint16_t samples = 8) {
   uint32_t sum = 0;
   for (uint16_t i = 0; i < samples; i++) {
     sum += analogRead(POT_PIN);
-    delayMicroseconds(500);
+    delayMicroseconds(200);
   }
   return sum / samples;
 }
 
-float readJointDeg() {
-  int raw = readPotRawAveraged(32);
-  raw = constrain(raw, potMinRaw, potMaxRaw);
+float rawToJointDegUnclamped(int raw) {
+  if (potMinRaw == potMaxRaw) return NAN;
 
   float t = float(raw - potMinRaw) / float(potMaxRaw - potMinRaw);
   return jointMinDeg + t * (jointMaxDeg - jointMinDeg);
 }
 
-int32_t jointDegToServoSteps(float jointDeg) {
-  float jointRev = jointDeg / 360.0f;
-  float servoRev = jointRev * GEAR_RATIO;
-  return int32_t(servoRev * SERVO_STEPS_PER_REV);
+float readJointDeg() {
+  return rawToJointDegUnclamped(readPotRawAveraged());
 }
 
-int32_t jointDeltaDegToServoSteps(float deltaDeg) {
-  float jointRev = deltaDeg / 360.0f;
-  float servoRev = jointRev * GEAR_RATIO;
-  return int32_t(servoRev * SERVO_STEPS_PER_REV);
+bool isHardOutOfRange(float deg) {
+  return deg < jointMinDeg - HARD_MARGIN_DEG || deg > jointMaxDeg + HARD_MARGIN_DEG;
 }
 
-void setStepperMode() {
-  st.EnableTorque(SERVO_ID, 0);
-  delay(100);
+bool movingTowardLimit(float deg, int speed) {
+  if (deg <= jointMinDeg + LIMIT_STOP_MARGIN_DEG && speed < 0) return true;
+  if (deg >= jointMaxDeg - LIMIT_STOP_MARGIN_DEG && speed > 0) return true;
+  return false;
+}
 
-  st.unLockEprom(SERVO_ID);
-  delay(50);
+// ---------- Servo ----------
 
-  st.writeByte(SERVO_ID, SMS_STS_MODE, 3);
-  st.writeWord(SERVO_ID, SMS_STS_MIN_ANGLE_LIMIT_L, 0);
-  st.writeWord(SERVO_ID, SMS_STS_MAX_ANGLE_LIMIT_L, 0);
+void driveSpeed(int logicalSpeed, bool force = false) {
+  logicalSpeed = constrain(logicalSpeed, -maxSpeed, maxSpeed);
+  int physicalSpeed = logicalSpeed * servoDirection;
 
-  delay(50);
-  st.LockEprom(SERVO_ID);
-  delay(100);
+  bool changedEnough = abs(physicalSpeed - lastPhysicalSpeedCommand) >= SPEED_CHANGE_THRESHOLD;
+  bool intervalPassed = millis() - lastSpeedCommandMs >= SPEED_COMMAND_INTERVAL_MS;
 
-  st.EnableTorque(SERVO_ID, 1);
+  if (force || (changedEnough && intervalPassed)) {
+    st.WriteSpe(SERVO_ID, physicalSpeed, activeAcc);
+    lastPhysicalSpeedCommand = physicalSpeed;
+    lastSpeedCommandMs = millis();
+  }
 }
 
 void stopServo() {
-  st.WritePosEx(SERVO_ID, 0, 0, 0);
+  st.WriteSpe(SERVO_ID, 0, 0);
+  lastPhysicalSpeedCommand = 0;
+  lastSpeedCommandMs = millis();
+  delay(20);
 }
 
-void moveJointRelativeDeg(float deltaDeg, int speed = DEFAULT_SPEED, int acc = DEFAULT_ACC) {
-  deltaDeg = constrain(deltaDeg, -MAX_SINGLE_MOVE_DEG, MAX_SINGLE_MOVE_DEG);
-
-  int32_t deltaSteps = jointDeltaDegToServoSteps(deltaDeg);
-  deltaSteps = constrain(deltaSteps, -30000, 30000);
-
-  if (abs(deltaSteps) < 2) return;
-
-  st.WritePosEx(SERVO_ID, deltaSteps, speed, acc);
+void emergencyStop(const char *reason) {
+  stopServo();
+  emergencyLatched = true;
+  Serial.print("NOT-STOPP: ");
+  Serial.println(reason);
+  Serial.println("Bewegung gesperrt. Erst 'clear' senden.");
 }
 
-void moveJointToDeg(float targetDeg) {
+bool safetyCheck(const char *context) {
+  float deg = readJointDeg();
+
+  if (isnan(deg)) {
+    emergencyStop("Poti-Kalibrierung ungueltig");
+    return false;
+  }
+
+  if (isHardOutOfRange(deg)) {
+    Serial.print("Winkel ausserhalb Bereich bei ");
+    Serial.print(context);
+    Serial.print(": ");
+    Serial.println(deg, 3);
+    emergencyStop("Poti-Randwert ueberschritten");
+    return false;
+  }
+
+  return true;
+}
+
+void setVelocityMode() {
+  st.EnableTorque(SERVO_ID, 0);
+  delay(100);
+
+  st.WheelMode(SERVO_ID);
+  delay(100);
+
+  st.EnableTorque(SERVO_ID, 1);
+  driveSpeed(0, true);
+
+  Serial.println("Geschwindigkeitsmodus gesetzt.");
+}
+
+bool userRequestedStopDuringMotion() {
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == '\n' || c == '\r') {
+      motionInputLine.trim();
+      if (motionInputLine == "stop" || motionInputLine == "s") {
+        motionInputLine = "";
+        emergencyStop("Manueller Stop");
+        return true;
+      }
+      motionInputLine = "";
+    } else {
+      motionInputLine += c;
+    }
+  }
+  return false;
+}
+
+// ---------- Bewegung nur per Poti-Regelung ----------
+
+int speedFromError(float errorDeg) {
+  float absError = fabsf(errorDeg);
+
+  if (absError <= toleranceDeg) return 0;
+
+  int speed = int(absError * kp);
+
+  if (absError > 1.0f) {
+    speed = max(speed, minSpeed);
+  }
+
+  if (absError < 8.0f) {
+    speed = min(speed, 220);
+  }
+
+  if (absError < 4.0f) {
+    speed = min(speed, 130);
+  }
+
+  if (absError < 2.0f) {
+    speed = min(speed, 70);
+  }
+
+  speed = constrain(speed, 0, maxSpeed);
+  if (errorDeg < 0) speed = -speed;
+
+  return speed;
+}
+
+void moveToByPot(float targetDeg) {
+  if (emergencyLatched) {
+    Serial.println("Gesperrt durch Not-Stopp. Erst 'clear' senden.");
+    return;
+  }
+
   targetDeg = constrain(targetDeg, jointMinDeg, jointMaxDeg);
 
-  Serial.print("Fahre auf ");
-  Serial.print(targetDeg, 3);
-  Serial.println(" deg");
+  if (!safetyCheck("go start")) return;
 
-  for (int i = 0; i < 80; i++) {
-    float nowDeg = readJointDeg();
-    float error = targetDeg - nowDeg;
+  uint32_t started = millis();
+  uint32_t lastPrint = 0;
 
-    Serial.print("Ist=");
-    Serial.print(nowDeg, 3);
-    Serial.print(" deg  Ziel=");
-    Serial.print(targetDeg, 3);
-    Serial.print(" deg  Fehler=");
-    Serial.println(error, 3);
+  while (true) {
+    if (userRequestedStopDuringMotion()) return;
 
-    if (abs(error) <= TARGET_TOLERANCE_DEG) {
-      stopServo();
-      currentTargetDeg = targetDeg;
-      Serial.println("Ziel erreicht.");
+    float currentDeg = readJointDeg();
+
+    if (isnan(currentDeg)) {
+      emergencyStop("Poti ungueltig");
       return;
     }
 
-    float stepDeg = constrain(error, -MAX_SINGLE_MOVE_DEG, MAX_SINGLE_MOVE_DEG);
-    moveJointRelativeDeg(stepDeg);
+    if (isHardOutOfRange(currentDeg)) {
+      emergencyStop("Poti-Randwert erreicht");
+      return;
+    }
 
-    delay(250);
+    float error = targetDeg - currentDeg;
+
+    if (fabsf(error) <= toleranceDeg) {
+      stopServo();
+      Serial.print("Ziel erreicht. Ist=");
+      Serial.println(currentDeg, 3);
+      return;
+    }
+
+    int speed = speedFromError(error);
+
+    if (movingTowardLimit(currentDeg, speed)) {
+      emergencyStop("Randwert-Sicherheitszone erreicht");
+      return;
+    }
+
+    driveSpeed(speed);
+
+    if (millis() - started > MOVE_TIMEOUT_MS) {
+      emergencyStop("Timeout bei Bewegung");
+      return;
+    }
+
+    if (millis() - lastPrint > 200) {
+      Serial.print("Ist=");
+      Serial.print(currentDeg, 3);
+      Serial.print(" Ziel=");
+      Serial.print(targetDeg, 3);
+      Serial.print(" Fehler=");
+      Serial.print(error, 3);
+      Serial.print(" Speed=");
+      Serial.println(speed);
+      lastPrint = millis();
+    }
+
+    delay(CONTROL_INTERVAL_MS);
   }
-
-  stopServo();
-  Serial.println("Abbruch: Ziel nicht sicher erreicht. Poti/Kalibrierung/Mechanik pruefen.");
 }
+
+void moveRelativeByPot(float deltaDeg) {
+  if (!safetyCheck("rel start")) return;
+
+  float currentDeg = readJointDeg();
+  float targetDeg = constrain(currentDeg + deltaDeg, jointMinDeg, jointMaxDeg);
+
+  moveToByPot(targetDeg);
+}
+
+// ---------- Kalibrierung ----------
 
 void saveCalibration() {
   prefs.begin("joint", false);
@@ -139,6 +276,7 @@ void saveCalibration() {
   prefs.putInt("potMax", potMaxRaw);
   prefs.putFloat("degMin", jointMinDeg);
   prefs.putFloat("degMax", jointMaxDeg);
+  prefs.putInt("dir", servoDirection);
   prefs.end();
   Serial.println("Kalibrierung gespeichert.");
 }
@@ -149,18 +287,21 @@ void loadCalibration() {
   potMaxRaw = prefs.getInt("potMax", potMaxRaw);
   jointMinDeg = prefs.getFloat("degMin", jointMinDeg);
   jointMaxDeg = prefs.getFloat("degMax", jointMaxDeg);
+  servoDirection = prefs.getInt("dir", servoDirection);
   prefs.end();
 }
 
+// ---------- Ausgabe ----------
+
 void printStatus() {
-  int raw = readPotRawAveraged();
-  float deg = readJointDeg();
+  int raw = readPotRawAveraged(16);
+  float deg = rawToJointDegUnclamped(raw);
 
   Serial.print("Poti raw=");
   Serial.print(raw);
-  Serial.print("  Winkel=");
+  Serial.print(" Winkel=");
   Serial.print(deg, 3);
-  Serial.print(" deg  Kalibrierung raw[");
+  Serial.print(" deg Bereich raw[");
   Serial.print(potMinRaw);
   Serial.print(", ");
   Serial.print(potMaxRaw);
@@ -168,38 +309,60 @@ void printStatus() {
   Serial.print(jointMinDeg, 3);
   Serial.print(", ");
   Serial.print(jointMaxDeg, 3);
-  Serial.println("]");
+  Serial.print("] kp=");
+  Serial.print(kp, 2);
+  Serial.print(" minSpeed=");
+  Serial.print(minSpeed);
+  Serial.print(" maxSpeed=");
+  Serial.print(maxSpeed);
+  Serial.print(" acc=");
+  Serial.print(activeAcc);
+  Serial.print(" dir=");
+  Serial.print(servoDirection);
+  Serial.print(" emergency=");
+  Serial.println(emergencyLatched ? "JA" : "nein");
+}
+
+void printRead() {
+  Serial.print("Ping: ");
+  Serial.println(st.Ping(SERVO_ID));
+  Serial.print("Mode: ");
+  Serial.println(st.ReadMode(SERVO_ID));
+  Serial.print("Pos: ");
+  Serial.println(st.ReadPos(SERVO_ID));
+  Serial.print("Speed: ");
+  Serial.println(st.ReadSpeed(SERVO_ID));
+  Serial.print("Voltage: ");
+  Serial.println(st.ReadVoltage(SERVO_ID));
+  Serial.print("Temp: ");
+  Serial.println(st.ReadTemper(SERVO_ID));
 }
 
 void printHelp() {
   Serial.println();
   Serial.println("Befehle:");
-  Serial.println("  help                 Hilfe anzeigen");
-  Serial.println("  status               Poti-Rohwert und Gelenkwinkel anzeigen");
-  Serial.println("  raw                  5 Sekunden Poti-Rohwerte streamen");
-  Serial.println("  setmin               aktuellen Poti-Wert als unteren Rand speichern");
-  Serial.println("  setmax               aktuellen Poti-Wert als oberen Rand speichern");
-  Serial.println("  range 0 150          Winkelbereich setzen, z.B. 0 bis 150 Grad");
-  Serial.println("  save                 Kalibrierung dauerhaft speichern");
-  Serial.println("  mode                 Servo in Stepper/Motor-Modus setzen");
-  Serial.println("  go 75                Gelenk auf 75 Grad fahren");
-  Serial.println("  rel 1                Gelenk relativ um +1 Grad bewegen");
-  Serial.println("  rel -0.2             Gelenk relativ um -0.2 Grad bewegen");
-  Serial.println("  stop                 Servo stoppen");
-  Serial.println();
-  Serial.println("  ping                 Servo-Kommunikation testen");
-  Serial.println("  read                 Servo-Werte lesen");
-  Serial.println("  test                 Servo 2 direkt relativ bewegen");
-  Serial.println("  torque on            Torque aktivieren");
-  Serial.println("  torque off           Torque deaktivieren");
-  Serial.println();
-  Serial.println("Kalibrierung:");
-  Serial.println("  1. Gelenk mechanisch an unteren Rand bewegen, dann: setmin");
-  Serial.println("  2. Gelenk mechanisch an oberen Rand bewegen, dann: setmax");
-  Serial.println("  3. range 0 150");
-  Serial.println("  4. save");
+  Serial.println("  status            Poti/Winkel/Reglerwerte");
+  Serial.println("  read              Servo-Werte lesen");
+  Serial.println("  raw               Poti-Rohwerte streamen");
+  Serial.println("  setmin            aktuellen Poti-Wert als unteren Rand setzen");
+  Serial.println("  setmax            aktuellen Poti-Wert als oberen Rand setzen");
+  Serial.println("  range 0 150       Winkelbereich setzen");
+  Serial.println("  save              Kalibrierung speichern");
+  Serial.println("  mode              Geschwindigkeitsmodus setzen");
+  Serial.println("  go 75             per Poti-Regelung auf Winkel fahren");
+  Serial.println("  rel 10            per Poti-Regelung relativ bewegen");
+  Serial.println("  stop / s          sofort stoppen");
+  Serial.println("  clear             Not-Stopp entsperren");
+  Serial.println("  kp 18             Reglerstaerke setzen");
+  Serial.println("  minspeed 35       Mindestgeschwindigkeit");
+  Serial.println("  maxspeed 500      Maximalgeschwindigkeit");
+  Serial.println("  acc 8             Beschleunigung");
+  Serial.println("  tol 0.35          Ziel-Toleranz in Grad");
+  Serial.println("  dir 1 / dir -1    Richtung setzen");
   Serial.println();
 }
+
+// ---------- Kommandos ----------
 
 void handleCommand(String cmd) {
   cmd.trim();
@@ -207,132 +370,125 @@ void handleCommand(String cmd) {
 
   if (cmd == "help") {
     printHelp();
+
   } else if (cmd == "status") {
     printStatus();
+
+  } else if (cmd == "read") {
+    printRead();
+
   } else if (cmd == "raw") {
-    uint32_t start = millis();
-    while (millis() - start < 5000) {
-      Serial.println(readPotRawAveraged(16));
+    uint32_t started = millis();
+    while (millis() - started < 5000) {
+      Serial.println(readPotRawAveraged(8));
       delay(100);
     }
+
   } else if (cmd == "setmin") {
-    potMinRaw = readPotRawAveraged();
+    potMinRaw = readPotRawAveraged(80);
     Serial.print("potMinRaw = ");
     Serial.println(potMinRaw);
+
   } else if (cmd == "setmax") {
-    potMaxRaw = readPotRawAveraged();
+    potMaxRaw = readPotRawAveraged(80);
     Serial.print("potMaxRaw = ");
     Serial.println(potMaxRaw);
+
   } else if (cmd.startsWith("range ")) {
     float a, b;
     if (sscanf(cmd.c_str(), "range %f %f", &a, &b) == 2 && b > a) {
       jointMinDeg = a;
       jointMaxDeg = b;
-      Serial.print("Winkelbereich gesetzt: ");
-      Serial.print(jointMinDeg, 3);
-      Serial.print(" bis ");
-      Serial.print(jointMaxDeg, 3);
-      Serial.println(" deg");
+      Serial.println("Winkelbereich gesetzt.");
+      printStatus();
     } else {
       Serial.println("Format: range 0 150");
     }
+
   } else if (cmd == "save") {
     saveCalibration();
+
   } else if (cmd == "mode") {
-    setStepperMode();
-    Serial.println("Stepper/Motor-Modus gesetzt.");
+    setVelocityMode();
+
   } else if (cmd.startsWith("go ")) {
     float target;
     if (sscanf(cmd.c_str(), "go %f", &target) == 1) {
-      moveJointToDeg(target);
+      moveToByPot(target);
     } else {
       Serial.println("Format: go 75");
     }
+
   } else if (cmd.startsWith("rel ")) {
     float delta;
     if (sscanf(cmd.c_str(), "rel %f", &delta) == 1) {
-      moveJointRelativeDegSafe(delta);
+      moveRelativeByPot(delta);
     } else {
-      Serial.println("Format: rel -0.2");
+      Serial.println("Format: rel -10");
     }
-    
-    } else if (cmd == "ping") {
-    int result = st.Ping(SERVO_ID);
-    Serial.print("Ping Servo ");
-    Serial.print(SERVO_ID);
-    Serial.print(": ");
-    Serial.println(result);
 
-  } else if (cmd == "read") {
-    Serial.print("Mode: ");
-    Serial.println(st.ReadMode(SERVO_ID));
-    Serial.print("Pos: ");
-    Serial.println(st.ReadPos(SERVO_ID));
-    Serial.print("Speed: ");
-    Serial.println(st.ReadSpeed(SERVO_ID));
-    Serial.print("Voltage: ");
-    Serial.println(st.ReadVoltage(SERVO_ID));
-    Serial.print("Temperatur: ");
-    Serial.println(st.ReadTemper(SERVO_ID));
-
-  } else if (cmd == "torque on") {
-    st.EnableTorque(SERVO_ID, 1);
-    Serial.println("Torque on.");
-
-  } else if (cmd == "torque off") {
-    st.EnableTorque(SERVO_ID, 0);
-    Serial.println("Torque off.");
-
-  } else if (cmd == "test") {
-    st.EnableTorque(SERVO_ID, 1);
-    st.WritePosEx(SERVO_ID, 3000, 1200, 50);
-    Serial.println("Testbewegung gesendet.");
-
-  } else if (cmd == "stop") {
+  } else if (cmd == "stop" || cmd == "s") {
     stopServo();
     Serial.println("Stop.");
+
+  } else if (cmd == "clear") {
+    emergencyLatched = false;
+    Serial.println("Not-Stopp entsperrt.");
+    printStatus();
+
+  } else if (cmd.startsWith("kp ")) {
+    float v;
+    if (sscanf(cmd.c_str(), "kp %f", &v) == 1) {
+      kp = constrain(v, 1.0f, 100.0f);
+      Serial.print("kp = ");
+      Serial.println(kp, 2);
+    }
+
+  } else if (cmd.startsWith("minspeed ")) {
+    int v;
+    if (sscanf(cmd.c_str(), "minspeed %d", &v) == 1) {
+      minSpeed = constrain(v, 1, maxSpeed);
+      Serial.print("minSpeed = ");
+      Serial.println(minSpeed);
+    }
+
+  } else if (cmd.startsWith("maxspeed ")) {
+    int v;
+    if (sscanf(cmd.c_str(), "maxspeed %d", &v) == 1) {
+      maxSpeed = constrain(v, minSpeed, 3000);
+      Serial.print("maxSpeed = ");
+      Serial.println(maxSpeed);
+    }
+
+  } else if (cmd.startsWith("acc ")) {
+    int v;
+    if (sscanf(cmd.c_str(), "acc %d", &v) == 1) {
+      activeAcc = constrain(v, 0, 254);
+      Serial.print("ACC = ");
+      Serial.println(activeAcc);
+    }
+
+  } else if (cmd.startsWith("tol ")) {
+    float v;
+    if (sscanf(cmd.c_str(), "tol %f", &v) == 1) {
+      toleranceDeg = constrain(v, 0.05f, 3.0f);
+      Serial.print("Toleranz = ");
+      Serial.println(toleranceDeg, 3);
+    }
+
+  } else if (cmd.startsWith("dir ")) {
+    int v;
+    if (sscanf(cmd.c_str(), "dir %d", &v) == 1 && (v == 1 || v == -1)) {
+      servoDirection = v;
+      Serial.print("Richtung = ");
+      Serial.println(servoDirection);
+    } else {
+      Serial.println("Format: dir 1 oder dir -1");
+    }
+
   } else {
     Serial.println("Unbekannter Befehl. Tippe: help");
   }
-}
-
-float readPotTUnclamped() {
-  int raw = readPotRawAveraged(32);
-  return float(raw - potMinRaw) / float(potMaxRaw - potMinRaw);
-}
-
-float readJointDegUnclamped() {
-  float t = readPotTUnclamped();
-  return jointMinDeg + t * (jointMaxDeg - jointMinDeg);
-}
-
-bool isOutsideJointRange(float deg) {
-  constexpr float MARGIN_DEG = 1.0f;
-  return deg < jointMinDeg - MARGIN_DEG || deg > jointMaxDeg + MARGIN_DEG;
-}
-
-void moveJointRelativeDegSafe(float requestedDeltaDeg) {
-  float currentDeg = readJointDegUnclamped();
-
-  Serial.print("Aktuell laut Poti: ");
-  Serial.print(currentDeg, 3);
-  Serial.println(" deg");
-
-  float requestedTarget = currentDeg + requestedDeltaDeg;
-  float safeTarget = constrain(requestedTarget, jointMinDeg, jointMaxDeg);
-  float safeDelta = safeTarget - currentDeg;
-
-  if (abs(safeDelta) < 0.05f) {
-    stopServo();
-    Serial.println("Bewegung blockiert: Limit erreicht oder ausserhalb des Bereichs.");
-    return;
-  }
-
-  moveJointRelativeDeg(safeDelta);
-
-  Serial.print("Relativ freigegeben: ");
-  Serial.print(safeDelta, 3);
-  Serial.println(" deg");
 }
 
 void setup() {
@@ -348,12 +504,9 @@ void setup() {
   loadCalibration();
 
   Serial.println();
-  Serial.println("ESP32S3 ST3215 Gelenk-Test");
+  Serial.println("ESP32S3 ST3215 Poti-geregelter Gelenk-Test");
   printHelp();
   printStatus();
-
-  // Erst manuell per 'mode' setzen, wenn alles verkabelt ist.
-  // setStepperMode();
 }
 
 void loop() {
