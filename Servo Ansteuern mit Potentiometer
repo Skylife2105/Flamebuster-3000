@@ -29,9 +29,11 @@ float jointMaxDeg = 150.0f;
 // Regler
 float kp = 18.0f;
 int minSpeed = 35;
-int maxSpeed = 500;
-int activeAcc = 8;
-float toleranceDeg = 0.35f;
+int crawlSpeed = 18;
+int maxSpeed = 600;
+int activeAcc = 0;
+float toleranceDeg = 0.7f;
+float slowZoneDeg = 12.0f;
 
 // Sicherheit
 constexpr float HARD_MARGIN_DEG = 0.4f;
@@ -168,27 +170,15 @@ int speedFromError(float errorDeg) {
 
   if (absError <= toleranceDeg) return 0;
 
-  int speed = int(absError * kp);
+  float x = constrain(absError / slowZoneDeg, 0.0f, 1.0f);
 
-  if (absError > 1.0f) {
-    speed = max(speed, minSpeed);
-  }
+  // Smoothstep: weiches Abbremsen statt harter Geschwindigkeitsstufen.
+  x = x * x * (3.0f - 2.0f * x);
 
-  if (absError < 8.0f) {
-    speed = min(speed, 220);
-  }
+  int speed = crawlSpeed + int((maxSpeed - crawlSpeed) * x);
+  speed = constrain(speed, crawlSpeed, maxSpeed);
 
-  if (absError < 4.0f) {
-    speed = min(speed, 130);
-  }
-
-  if (absError < 2.0f) {
-    speed = min(speed, 70);
-  }
-
-  speed = constrain(speed, 0, maxSpeed);
   if (errorDeg < 0) speed = -speed;
-
   return speed;
 }
 
