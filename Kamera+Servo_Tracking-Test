@@ -1,0 +1,1401 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SCServo.h>
+#include <Preferences.h>
+#include <math.h>
+#include <string.h>
+
+// Deine Kamera-Version nutzt Serial0 fuer den Laptop-Viewer.
+#define Serial Serial0
+
+SMS_STS st;
+Preferences prefs;
+
+// ============================================================
+// PINBELEGUNG
+// ============================================================
+// Kamera-Pins aus deinem Kamera-Code.
+// Achtung: GPIO17/18 sind hier SPI, deshalb duerfen sie nicht mehr
+// gleichzeitig fuer den Servo-Bus verwendet werden.
+static constexpr uint8_t PIN_RESET = 4;
+static constexpr uint8_t PIN_READY = 5;
+static constexpr uint8_t PIN_SDA = 6;
+static constexpr uint8_t PIN_SCL = 7;
+static constexpr uint8_t PIN_SS = 15;
+static constexpr uint8_t PIN_CLK = 16;
+static constexpr uint8_t PIN_MISO = 17;
+static constexpr uint8_t PIN_MOSI = 18;
+
+// Servo-Bus und Poti muessen auf freie Pins gelegt werden.
+// Diese Werte sind Beispiel-Pins und muessen zu deiner Verdrahtung passen.
+constexpr int SERVO_RX = 9;
+constexpr int SERVO_TX = 10;
+constexpr int POT_PIN  = 8;
+
+// ============================================================
+// KAMERA
+// ============================================================
+static constexpr uint8_t I2C_ADDR_DEFAULT = 0x40;
+static constexpr uint8_t I2C_ADDR_ALT = 0x41;
+
+static constexpr uint8_t REG_FRAME_MODE = 0xB1;
+static constexpr uint8_t REG_FW_VERSION_1 = 0xB2;
+static constexpr uint8_t REG_FW_VERSION_2 = 0xB3;
+static constexpr uint8_t REG_FRAME_RATE = 0xB4;
+static constexpr uint8_t REG_STATUS = 0xB6;
+
+static constexpr uint8_t FRAME_MODE_CONTINUOUS = 0x02;
+static constexpr uint8_t FRAME_MODE_NO_HEADER = 0x20;
+
+static constexpr uint8_t STATUS_DATA_READY = 0x10;
+static constexpr uint8_t STATUS_BOOTING = 0x20;
+
+static constexpr uint16_t WIDTH = 80;
+static constexpr uint16_t HEIGHT = 62;
+static constexpr uint16_t PIXELS = WIDTH * HEIGHT;
+static constexpr float CAMERA_CENTER_X = (WIDTH - 1) * 0.5f;
+static constexpr float CAMERA_CENTER_Y = (HEIGHT - 1) * 0.5f;
+
+static constexpr uint8_t PROTOCOL_VERSION = 2;
+static constexpr uint8_t FRAME_FLAG_NORMALIZED = 0x01;
+static constexpr uint8_t FRAME_FLAG_ROW_CORRECTED = 0x02;
+static constexpr uint8_t FRAME_FLAG_HOTSPOT = 0x04;
+
+static constexpr uint8_t FRAME_RATE_DIVIDER = 1;
+static constexpr uint32_t SERIAL_BAUD = 921600;
+static constexpr uint32_t SPI_CLOCK_HZ = 4000000;
+
+uint8_t cameraI2cAddr = I2C_ADDR_DEFAULT;
+uint16_t rawFrame[PIXELS];
+uint8_t grayFrame[PIXELS];
+uint32_t frameCounter = 0;
+bool cameraConfigured = false;
+uint32_t lastConfigureAttemptMs = 0;
+uint32_t lastDiagnosticFrameMs = 0;
+uint32_t lastStatusReportMs = 0;
+bool streamMode = false;
+
+struct Hotspot {
+  float x;
+  float y;
+  uint16_t count;
+};
+
+// ============================================================
+// SERVOS
+// ============================================================
+constexpr uint8_t SERVO2_ID = 2;
+constexpr int SERVO_BAUD = 1000000;
+
+constexpr int SERVO_POS_MIN = 0;
+constexpr int SERVO_POS_MAX = 4095;
+constexpr float SERVO_FULL_TURN_DEG = 360.0f;
+
+constexpr uint16_t POSITION_SERVO_SPEED = 1000;
+constexpr uint8_t POSITION_SERVO_ACC = 20;
+
+constexpr float SERVO1_MIN_DEG = 135.0f;
+constexpr float SERVO1_MAX_DEG = 225.0f;
+
+constexpr float SERVO3_FAILSAFE_MIN_DEG = 300.0f;
+constexpr float SERVO3_FAILSAFE_MAX_DEG = 335.0f;
+constexpr float SERVO4_NORMAL_MIN_DEG = 90.0f;
+constexpr float SERVO4_FAILSAFE_MIN_DEG = 170.0f;
+constexpr float SERVO4_MAX_DEG = 270.0f;
+
+struct PositionServoConfig {
+  uint8_t id;
+  float minDeg;
+  float maxDeg;
+};
+
+const PositionServoConfig POSITION_SERVOS[] = {
+  {1, SERVO1_MIN_DEG, SERVO1_MAX_DEG},
+  {3, 100.0f, 335.0f},
+  {4, SERVO4_NORMAL_MIN_DEG, SERVO4_MAX_DEG},
+};
+
+constexpr uint8_t POSITION_SERVO_COUNT =
+    sizeof(POSITION_SERVOS) / sizeof(POSITION_SERVOS[0]);
+
+float lastServo1CommandDeg = NAN;
+float lastServo3CommandDeg = NAN;
+float lastServo4CommandDeg = NAN;
+uint32_t lastFailsafeCheckMs = 0;
+
+constexpr uint32_t SPEED_COMMAND_INTERVAL_MS = 50;
+constexpr int SPEED_CHANGE_THRESHOLD = 10;
+
+int lastPhysicalSpeedCommand = 99999;
+uint32_t lastSpeedCommandMs = 0;
+
+int potMinRaw = 200;
+int potMaxRaw = 2400;
+float jointMinDeg = 0.0f;
+float jointMaxDeg = 125.0f;
+
+float kp = 18.0f;
+int minSpeed = 35;
+int maxSpeed = 1500;
+int activeAcc = 0;
+float toleranceDeg = 0.7f;
+
+constexpr float HARD_MARGIN_DEG = 0.4f;
+constexpr float LIMIT_STOP_MARGIN_DEG = 0.8f;
+constexpr uint32_t CONTROL_INTERVAL_MS = 5;
+constexpr uint32_t MOVE_TIMEOUT_MS = 20000;
+constexpr uint32_t FAILSAFE_CHECK_INTERVAL_MS = 250;
+
+int servoDirection = 1;
+
+String inputLine;
+String motionInputLine;
+bool emergencyLatched = false;
+
+// ============================================================
+// THERMAL TRACKING
+// ============================================================
+bool trackingActive = false;
+uint32_t lastTrackingCommandMs = 0;
+uint32_t lastTrackingPrintMs = 0;
+
+constexpr uint32_t TRACK_UPDATE_INTERVAL_MS = 120;
+constexpr uint32_t TRACK_PRINT_INTERVAL_MS = 500;
+constexpr float TRACK_DEADBAND_PX = 2.0f;
+constexpr float TRACK_KP_DEG_PER_PIXEL = 0.18f;
+constexpr float TRACK_MAX_STEP_DEG = 2.0f;
+constexpr uint16_t TRACK_SERVO_SPEED = 700;
+constexpr uint8_t TRACK_SERVO_ACC = 10;
+
+// Wenn die Regelung falsch herum laeuft: Vorzeichen auf -1 setzen.
+int trackServo1Sign = 1;
+int trackServo4Sign = 1;
+
+// ============================================================
+// KAMERA-FUNKTIONEN
+// ============================================================
+bool i2cWrite8(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(cameraI2cAddr);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+bool i2cRead8(uint8_t reg, uint8_t &value) {
+  Wire.beginTransmission(cameraI2cAddr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+
+  if (Wire.requestFrom(cameraI2cAddr, static_cast<uint8_t>(1)) != 1) {
+    return false;
+  }
+
+  value = Wire.read();
+  return true;
+}
+
+bool cameraResponds(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
+void resetCamera() {
+  digitalWrite(PIN_RESET, LOW);
+  delay(5);
+  digitalWrite(PIN_RESET, HIGH);
+}
+
+bool waitUntilBooted(uint32_t timeoutMs) {
+  const uint32_t start = millis();
+  while (millis() - start < timeoutMs) {
+    uint8_t status = 0;
+    if (i2cRead8(REG_STATUS, status) && (status & STATUS_BOOTING) == 0) {
+      return true;
+    }
+    delay(50);
+  }
+  return false;
+}
+
+bool waitForFrameReady(uint32_t timeoutMs) {
+  const uint32_t start = millis();
+  while (millis() - start < timeoutMs) {
+    if (digitalRead(PIN_READY) == HIGH) return true;
+
+    uint8_t status = 0;
+    if (i2cRead8(REG_STATUS, status) && (status & STATUS_DATA_READY)) {
+      return true;
+    }
+
+    delay(2);
+  }
+  return false;
+}
+
+uint16_t spiReadWord() {
+  const uint8_t hi = SPI.transfer(0x00);
+  const uint8_t lo = SPI.transfer(0x00);
+  return (static_cast<uint16_t>(hi) << 8) | lo;
+}
+
+bool readThermalFrame(uint16_t &minValue, uint16_t &maxValue) {
+  minValue = 0xFFFF;
+  maxValue = 0;
+
+  SPI.beginTransaction(SPISettings(SPI_CLOCK_HZ, MSBFIRST, SPI_MODE0));
+  digitalWrite(PIN_SS, LOW);
+
+  for (uint16_t i = 0; i < PIXELS; ++i) {
+    const uint16_t value = spiReadWord();
+    rawFrame[i] = value;
+    if (value < minValue) minValue = value;
+    if (value > maxValue) maxValue = value;
+  }
+
+  digitalWrite(PIN_SS, HIGH);
+  SPI.endTransaction();
+
+  return maxValue > minValue;
+}
+
+void normalizeFrame(uint16_t minValue, uint16_t maxValue) {
+  const uint16_t span = maxValue - minValue;
+  for (uint16_t i = 0; i < PIXELS; ++i) {
+    const uint32_t shifted = rawFrame[i] - minValue;
+    grayFrame[i] = static_cast<uint8_t>((shifted * 255U) / span);
+  }
+}
+
+uint8_t medianFromHistogram(uint16_t histogram[256], uint16_t total) {
+  uint16_t seen = 0;
+  const uint16_t target = total / 2;
+
+  for (uint16_t value = 0; value < 256; ++value) {
+    seen += histogram[value];
+    if (seen > target) return static_cast<uint8_t>(value);
+  }
+
+  return 255;
+}
+
+uint8_t clampU8(int16_t value) {
+  if (value < 0) return 0;
+  if (value > 255) return 255;
+  return static_cast<uint8_t>(value);
+}
+
+void applyRowBandCorrection() {
+  uint16_t histogram[256] = {};
+  for (uint16_t i = 0; i < PIXELS; ++i) {
+    ++histogram[grayFrame[i]];
+  }
+  const uint8_t globalMedian = medianFromHistogram(histogram, PIXELS);
+
+  for (uint16_t y = 0; y < HEIGHT; ++y) {
+    memset(histogram, 0, sizeof(histogram));
+    const uint16_t rowStart = y * WIDTH;
+    for (uint16_t x = 0; x < WIDTH; ++x) {
+      ++histogram[grayFrame[rowStart + x]];
+    }
+
+    const uint8_t rowMedian = medianFromHistogram(histogram, WIDTH);
+    const int16_t offset = static_cast<int16_t>(rowMedian) - globalMedian;
+    for (uint16_t x = 0; x < WIDTH; ++x) {
+      const uint16_t index = rowStart + x;
+      grayFrame[index] = clampU8(static_cast<int16_t>(grayFrame[index]) - offset);
+    }
+  }
+}
+
+void writeU16LE(uint16_t value) {
+  Serial.write(static_cast<uint8_t>(value & 0xFF));
+  Serial.write(static_cast<uint8_t>((value >> 8) & 0xFF));
+}
+
+void writeU32LE(uint32_t value) {
+  Serial.write(static_cast<uint8_t>(value & 0xFF));
+  Serial.write(static_cast<uint8_t>((value >> 8) & 0xFF));
+  Serial.write(static_cast<uint8_t>((value >> 16) & 0xFF));
+  Serial.write(static_cast<uint8_t>((value >> 24) & 0xFF));
+}
+
+uint16_t coordinateToTenths(float coordinate) {
+  const float scaled = coordinate * 10.0f;
+  if (scaled < 0.0f) return 0;
+  if (scaled > 65535.0f) return 65535;
+  return static_cast<uint16_t>(scaled + 0.5f);
+}
+
+void sendFrame(uint16_t minValue, uint16_t maxValue, const Hotspot &hotspot) {
+  static const uint8_t magic[4] = {'T', 'H', 'R', 'M'};
+
+  Serial.write(magic, sizeof(magic));
+  Serial.write(static_cast<uint8_t>(PROTOCOL_VERSION));
+  Serial.write(static_cast<uint8_t>(WIDTH));
+  Serial.write(static_cast<uint8_t>(HEIGHT));
+  Serial.write(static_cast<uint8_t>(
+    FRAME_FLAG_NORMALIZED | FRAME_FLAG_ROW_CORRECTED | FRAME_FLAG_HOTSPOT
+  ));
+  writeU32LE(frameCounter++);
+  writeU16LE(minValue);
+  writeU16LE(maxValue);
+  writeU16LE(coordinateToTenths(hotspot.x));
+  writeU16LE(coordinateToTenths(hotspot.y));
+  writeU16LE(hotspot.count);
+  Serial.write(grayFrame, PIXELS);
+}
+
+Hotspot findHotspotCenter(uint16_t maxValue) {
+  uint32_t sumX = 0;
+  uint32_t sumY = 0;
+  uint16_t count = 0;
+
+  for (uint16_t i = 0; i < PIXELS; ++i) {
+    if (rawFrame[i] == maxValue) {
+      sumX += i % WIDTH;
+      sumY += i / WIDTH;
+      ++count;
+    }
+  }
+
+  Hotspot hotspot = {0.0f, 0.0f, 0};
+  if (count > 0) {
+    hotspot.x = static_cast<float>(sumX) / count;
+    hotspot.y = static_cast<float>(sumY) / count;
+    hotspot.count = count;
+  }
+  return hotspot;
+}
+
+void printDiagnosticFrame(uint16_t minValue, uint16_t maxValue, const Hotspot &hotspot) {
+  const float minC = minValue / 10.0f - 273.15f;
+  const float maxC = maxValue / 10.0f - 273.15f;
+
+  Serial.printf(
+    "SPI DATA OK #%lu | min %.1f C | max %.1f C | hotspot x=%.1f y=%.1f (%u px) | tracking=%s | READY=%d\n",
+    static_cast<unsigned long>(frameCounter++),
+    minC,
+    maxC,
+    hotspot.x,
+    hotspot.y,
+    hotspot.count,
+    trackingActive ? "ON" : "OFF",
+    digitalRead(PIN_READY)
+  );
+}
+
+void printStatusReport(const char *prefix) {
+  const bool ack40 = cameraResponds(I2C_ADDR_DEFAULT);
+  const bool ack41 = cameraResponds(I2C_ADDR_ALT);
+  uint8_t status = 0;
+  const bool statusOk = i2cRead8(REG_STATUS, status);
+
+  Serial.printf(
+    "%s | I2C 0x40=%s 0x41=%s | STATUS=%s",
+    prefix,
+    ack40 ? "ACK" : "NO",
+    ack41 ? "ACK" : "NO",
+    statusOk ? "OK" : "ERR"
+  );
+
+  if (statusOk) {
+    Serial.printf(
+      " value=0x%02X booting=%s data_ready=%s",
+      status,
+      (status & STATUS_BOOTING) ? "yes" : "no",
+      (status & STATUS_DATA_READY) ? "yes" : "no"
+    );
+  }
+
+  Serial.printf(" | READY pin=%d\n", digitalRead(PIN_READY));
+}
+
+bool configureCamera() {
+  Serial.println("CHECK scanning I2C addresses 0x40 and 0x41");
+  printStatusReport("CAMERA BUS CHECK");
+
+  if (cameraResponds(I2C_ADDR_DEFAULT)) {
+    cameraI2cAddr = I2C_ADDR_DEFAULT;
+  } else if (cameraResponds(I2C_ADDR_ALT)) {
+    cameraI2cAddr = I2C_ADDR_ALT;
+  } else {
+    Serial.println("CAMERA NOT FOUND | no ACK on I2C address 0x40 or 0x41");
+    return false;
+  }
+
+  Serial.printf("CAMERA FOUND | I2C address 0x%02X\n", cameraI2cAddr);
+
+  if (!waitUntilBooted(3000)) {
+    Serial.println("CAMERA ERROR | STATUS not readable or camera still booting");
+    printStatusReport("CAMERA STATUS AFTER BOOT TIMEOUT");
+    return false;
+  }
+
+  uint8_t fw1 = 0;
+  uint8_t fw2 = 0;
+  if (i2cRead8(REG_FW_VERSION_1, fw1) && i2cRead8(REG_FW_VERSION_2, fw2)) {
+    const uint8_t major = fw1 >> 4;
+    const uint8_t minor = fw1 & 0x0F;
+    Serial.printf("CAMERA OK | firmware %u.%u.%u\n", major, minor, fw2);
+  } else {
+    Serial.println("CAMERA WARNING | firmware registers not readable");
+  }
+
+  if (!i2cWrite8(REG_FRAME_RATE, FRAME_RATE_DIVIDER)) {
+    Serial.println("CAMERA ERROR | failed to set frame rate");
+    return false;
+  }
+
+  if (!i2cWrite8(REG_FRAME_MODE, FRAME_MODE_NO_HEADER | FRAME_MODE_CONTINUOUS)) {
+    Serial.println("CAMERA ERROR | failed to start continuous mode");
+    return false;
+  }
+
+  Serial.println("CAMERA STREAM READY | waiting for DATA_READY and SPI frames");
+  Serial.println("MODE text diagnostics | open Python viewer for image, or send STREAM");
+  return true;
+}
+
+// ============================================================
+// SERVO-HILFSFUNKTIONEN
+// ============================================================
+const PositionServoConfig *findPositionServo(uint8_t id) {
+  for (uint8_t i = 0; i < POSITION_SERVO_COUNT; i++) {
+    if (POSITION_SERVOS[i].id == id) return &POSITION_SERVOS[i];
+  }
+  return nullptr;
+}
+
+bool isPositionServoId(uint8_t id) {
+  return findPositionServo(id) != nullptr;
+}
+
+int degToServoPos(float deg) {
+  long pos = lroundf(deg * float(SERVO_POS_MAX) / SERVO_FULL_TURN_DEG);
+  return constrain(pos, SERVO_POS_MIN, SERVO_POS_MAX);
+}
+
+float servoPosToDeg(int pos) {
+  return float(pos) * SERVO_FULL_TURN_DEG / float(SERVO_POS_MAX);
+}
+
+bool servo3AngleIsInFailsafeZone(float deg) {
+  return deg >= SERVO3_FAILSAFE_MIN_DEG && deg <= SERVO3_FAILSAFE_MAX_DEG;
+}
+
+float readPositionServoDeg(uint8_t id) {
+  int pos = st.ReadPos(id);
+  if (pos < SERVO_POS_MIN || pos > SERVO_POS_MAX) return NAN;
+  return servoPosToDeg(pos);
+}
+
+int readPotRawAveraged(uint16_t samples = 8) {
+  uint32_t sum = 0;
+  for (uint16_t i = 0; i < samples; i++) {
+    sum += analogRead(POT_PIN);
+    delayMicroseconds(200);
+  }
+  return sum / samples;
+}
+
+float rawToJointDegUnclamped(int raw) {
+  if (potMinRaw == potMaxRaw) return NAN;
+
+  float t = float(raw - potMinRaw) / float(potMaxRaw - potMinRaw);
+  return jointMinDeg + t * (jointMaxDeg - jointMinDeg);
+}
+
+float readJointDeg() {
+  return rawToJointDegUnclamped(readPotRawAveraged());
+}
+
+bool isHardOutOfRange(float deg) {
+  return deg < jointMinDeg - HARD_MARGIN_DEG || deg > jointMaxDeg + HARD_MARGIN_DEG;
+}
+
+bool movingTowardLimit(float deg, int speed) {
+  if (deg <= jointMinDeg + LIMIT_STOP_MARGIN_DEG && speed < 0) return true;
+  if (deg >= jointMaxDeg - LIMIT_STOP_MARGIN_DEG && speed > 0) return true;
+  return false;
+}
+
+void driveSpeed(int logicalSpeed, bool force = false) {
+  logicalSpeed = constrain(logicalSpeed, -maxSpeed, maxSpeed);
+  int physicalSpeed = logicalSpeed * servoDirection;
+
+  bool changedEnough = abs(physicalSpeed - lastPhysicalSpeedCommand) >= SPEED_CHANGE_THRESHOLD;
+  bool intervalPassed = millis() - lastSpeedCommandMs >= SPEED_COMMAND_INTERVAL_MS;
+
+  if (force || (changedEnough && intervalPassed)) {
+    st.WriteSpe(SERVO2_ID, physicalSpeed, activeAcc);
+    lastPhysicalSpeedCommand = physicalSpeed;
+    lastSpeedCommandMs = millis();
+  }
+}
+
+void stopServo2() {
+  st.WriteSpe(SERVO2_ID, 0, 0);
+  lastPhysicalSpeedCommand = 0;
+  lastSpeedCommandMs = millis();
+  delay(20);
+}
+
+void setServo2VelocityMode() {
+  st.EnableTorque(SERVO2_ID, 0);
+  delay(100);
+  st.WheelMode(SERVO2_ID);
+  delay(100);
+  st.EnableTorque(SERVO2_ID, 1);
+  driveSpeed(0, true);
+  Serial.println("Servo 2: Geschwindigkeitsmodus gesetzt.");
+}
+
+int speedFromError(float errorDeg) {
+  float absError = fabsf(errorDeg);
+  if (absError <= toleranceDeg) return 0;
+
+  int speed = int(absError * kp);
+  speed = constrain(speed, minSpeed, maxSpeed);
+
+  if (errorDeg < 0) speed = -speed;
+  return speed;
+}
+
+void stopPositionServo(uint8_t id) {
+  int pos = st.ReadPos(id);
+  if (pos >= SERVO_POS_MIN && pos <= SERVO_POS_MAX) {
+    st.WritePosEx(id, pos, 0, 0);
+  }
+}
+
+void stopAllServos() {
+  trackingActive = false;
+  stopServo2();
+  for (uint8_t i = 0; i < POSITION_SERVO_COUNT; i++) {
+    stopPositionServo(POSITION_SERVOS[i].id);
+  }
+}
+
+void emergencyStop(const char *reason) {
+  stopAllServos();
+  emergencyLatched = true;
+  Serial.print("NOT-STOPP: ");
+  Serial.println(reason);
+  Serial.println("Bewegung gesperrt. Erst 'clear' senden.");
+}
+
+bool safetyCheck(const char *context) {
+  float deg = readJointDeg();
+
+  if (isnan(deg)) {
+    emergencyStop("Poti-Kalibrierung ungueltig");
+    return false;
+  }
+
+  if (isHardOutOfRange(deg)) {
+    Serial.print("Winkel ausserhalb Bereich bei ");
+    Serial.print(context);
+    Serial.print(": ");
+    Serial.println(deg, 3);
+    emergencyStop("Poti-Randwert ueberschritten");
+    return false;
+  }
+
+  return true;
+}
+
+bool servo3RequiresServo4Restriction() {
+  float servo3Deg = readPositionServoDeg(3);
+
+  if (isnan(servo3Deg) && !isnan(lastServo3CommandDeg)) {
+    servo3Deg = lastServo3CommandDeg;
+  }
+
+  if (isnan(servo3Deg)) return false;
+  return servo3AngleIsInFailsafeZone(servo3Deg);
+}
+
+float effectiveServoMinDeg(uint8_t id) {
+  const PositionServoConfig *cfg = findPositionServo(id);
+  if (cfg == nullptr) return NAN;
+
+  if (id == 4 && servo3RequiresServo4Restriction()) {
+    return SERVO4_FAILSAFE_MIN_DEG;
+  }
+
+  return cfg->minDeg;
+}
+
+float effectiveServoMaxDeg(uint8_t id) {
+  const PositionServoConfig *cfg = findPositionServo(id);
+  if (cfg == nullptr) return NAN;
+  return cfg->maxDeg;
+}
+
+void commandPositionServo(
+  uint8_t id,
+  float targetDeg,
+  uint16_t speed = POSITION_SERVO_SPEED,
+  uint8_t acc = POSITION_SERVO_ACC,
+  bool verbose = true
+) {
+  int targetPos = degToServoPos(targetDeg);
+  st.WritePosEx(id, targetPos, speed, acc);
+
+  if (id == 1) lastServo1CommandDeg = targetDeg;
+  if (id == 3) lastServo3CommandDeg = targetDeg;
+  if (id == 4) lastServo4CommandDeg = targetDeg;
+
+  if (verbose && !streamMode) {
+    Serial.print("Servo ");
+    Serial.print(id);
+    Serial.print(" -> ");
+    Serial.print(targetDeg, 2);
+    Serial.print(" deg (pos=");
+    Serial.print(targetPos);
+    Serial.println(")");
+  }
+}
+
+void ensureServo4AboveFailsafeMin() {
+  float servo4Deg = readPositionServoDeg(4);
+
+  if (isnan(servo4Deg) && !isnan(lastServo4CommandDeg)) {
+    servo4Deg = lastServo4CommandDeg;
+  }
+
+  if (isnan(servo4Deg) || servo4Deg < SERVO4_FAILSAFE_MIN_DEG) {
+    if (!streamMode) {
+      Serial.println("Failsafe: Servo 4 wird auf mindestens 170 deg gesetzt.");
+    }
+    commandPositionServo(4, SERVO4_FAILSAFE_MIN_DEG);
+    delay(300);
+  }
+}
+
+void movePositionServo(uint8_t id, float requestedDeg) {
+  if (emergencyLatched) {
+    Serial.println("Gesperrt durch Not-Stopp. Erst 'clear' senden.");
+    return;
+  }
+
+  const PositionServoConfig *cfg = findPositionServo(id);
+  if (cfg == nullptr) {
+    Serial.println("Nur Servo 1, 3 und 4 sind Positionsservos.");
+    return;
+  }
+
+  float minDeg = effectiveServoMinDeg(id);
+  float maxDeg = effectiveServoMaxDeg(id);
+  float targetDeg = constrain(requestedDeg, minDeg, maxDeg);
+
+  if (id == 3 && servo3AngleIsInFailsafeZone(targetDeg)) {
+    ensureServo4AboveFailsafeMin();
+  }
+
+  if (requestedDeg != targetDeg && !streamMode) {
+    Serial.print("Ziel begrenzt auf ");
+    Serial.print(targetDeg, 2);
+    Serial.println(" deg.");
+  }
+
+  commandPositionServo(id, targetDeg);
+}
+
+void periodicFailsafeCheck() {
+  if (emergencyLatched) return;
+  if (millis() - lastFailsafeCheckMs < FAILSAFE_CHECK_INTERVAL_MS) return;
+  lastFailsafeCheckMs = millis();
+
+  if (!servo3RequiresServo4Restriction()) return;
+
+  float servo4Deg = readPositionServoDeg(4);
+  if (!isnan(servo4Deg) && servo4Deg < SERVO4_FAILSAFE_MIN_DEG - 0.5f) {
+    if (!streamMode) {
+      Serial.println("Failsafe aktiv: Servo 4 unter 170 deg, korrigiere.");
+    }
+    commandPositionServo(4, SERVO4_FAILSAFE_MIN_DEG);
+  }
+}
+
+void setPositionMode(uint8_t id) {
+  if (!isPositionServoId(id)) {
+    Serial.println("Positionsmodus ist hier fuer Servo 1, 3 oder 4 gedacht.");
+    return;
+  }
+
+  st.EnableTorque(id, 0);
+  delay(100);
+  st.writeByte(id, SMS_STS_MODE, 0);
+  delay(100);
+  st.EnableTorque(id, 1);
+
+  Serial.print("Servo ");
+  Serial.print(id);
+  Serial.println(": Positionsmodus gesetzt.");
+}
+
+// ============================================================
+// SERVO 2 POTI-BEWEGUNG
+// ============================================================
+bool userRequestedStopDuringMotion() {
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == '\n' || c == '\r') {
+      motionInputLine.trim();
+      if (motionInputLine == "stop" || motionInputLine == "s") {
+        motionInputLine = "";
+        emergencyStop("Manueller Stop");
+        return true;
+      }
+      motionInputLine = "";
+    } else {
+      motionInputLine += c;
+    }
+  }
+  return false;
+}
+
+void moveToByPot(float targetDeg) {
+  if (emergencyLatched) {
+    Serial.println("Gesperrt durch Not-Stopp. Erst 'clear' senden.");
+    return;
+  }
+
+  targetDeg = constrain(targetDeg, jointMinDeg, jointMaxDeg);
+
+  if (!safetyCheck("go start")) return;
+
+  uint32_t started = millis();
+  uint32_t lastPrint = 0;
+
+  while (true) {
+    if (userRequestedStopDuringMotion()) return;
+
+    float currentDeg = readJointDeg();
+
+    if (isnan(currentDeg)) {
+      emergencyStop("Poti ungueltig");
+      return;
+    }
+
+    if (isHardOutOfRange(currentDeg)) {
+      emergencyStop("Poti-Randwert erreicht");
+      return;
+    }
+
+    float error = targetDeg - currentDeg;
+
+    if (fabsf(error) <= toleranceDeg) {
+      stopServo2();
+      Serial.print("Servo 2 Ziel erreicht. Ist=");
+      Serial.println(currentDeg, 3);
+      return;
+    }
+
+    int speed = speedFromError(error);
+
+    if (movingTowardLimit(currentDeg, speed)) {
+      emergencyStop("Randwert-Sicherheitszone erreicht");
+      return;
+    }
+
+    driveSpeed(speed);
+
+    if (millis() - started > MOVE_TIMEOUT_MS) {
+      emergencyStop("Timeout bei Bewegung");
+      return;
+    }
+
+    if (millis() - lastPrint > 200) {
+      Serial.print("Servo2 Ist=");
+      Serial.print(currentDeg, 3);
+      Serial.print(" Ziel=");
+      Serial.print(targetDeg, 3);
+      Serial.print(" Fehler=");
+      Serial.print(error, 3);
+      Serial.print(" Speed=");
+      Serial.println(speed);
+      lastPrint = millis();
+    }
+
+    delay(CONTROL_INTERVAL_MS);
+  }
+}
+
+void moveRelativeByPot(float deltaDeg) {
+  if (!safetyCheck("rel start")) return;
+
+  float currentDeg = readJointDeg();
+  float targetDeg = constrain(currentDeg + deltaDeg, jointMinDeg, jointMaxDeg);
+
+  moveToByPot(targetDeg);
+}
+
+// ============================================================
+// THERMAL TRACKING
+// ============================================================
+float limitedStep(float wantedStep) {
+  return constrain(wantedStep, -TRACK_MAX_STEP_DEG, TRACK_MAX_STEP_DEG);
+}
+
+bool readTrackingStartPositions() {
+  float servo1Deg = readPositionServoDeg(1);
+  float servo4Deg = readPositionServoDeg(4);
+
+  if (isnan(servo1Deg) || isnan(servo4Deg)) {
+    Serial.println("TRACK ERROR | Servo 1 oder Servo 4 Position nicht lesbar.");
+    return false;
+  }
+
+  lastServo1CommandDeg = constrain(servo1Deg, SERVO1_MIN_DEG, SERVO1_MAX_DEG);
+  lastServo4CommandDeg = constrain(servo4Deg, effectiveServoMinDeg(4), effectiveServoMaxDeg(4));
+  return true;
+}
+
+void startTracking() {
+  if (emergencyLatched) {
+    Serial.println("Gesperrt durch Not-Stopp. Erst 'clear' senden.");
+    return;
+  }
+
+  stopServo2();
+
+  if (!readTrackingStartPositions()) {
+    trackingActive = false;
+    return;
+  }
+
+  trackingActive = true;
+  lastTrackingCommandMs = 0;
+  lastTrackingPrintMs = 0;
+
+  Serial.println("TRACK START | Servo 1 und 4 folgen dem Hotspot. Servo 2 und 3 bleiben unveraendert.");
+}
+
+void stopTrackingOnly() {
+  trackingActive = false;
+  Serial.println("TRACK STOP | Manuelle Servo-Kommandos sind aktiv.");
+}
+
+void updateThermalTracking(const Hotspot &hotspot) {
+  if (!trackingActive || emergencyLatched) return;
+  if (hotspot.count == 0) return;
+  if (millis() - lastTrackingCommandMs < TRACK_UPDATE_INTERVAL_MS) return;
+  lastTrackingCommandMs = millis();
+
+  float errorX = hotspot.x - CAMERA_CENTER_X;
+  float errorY = hotspot.y - CAMERA_CENTER_Y;
+
+  if (fabsf(errorX) <= TRACK_DEADBAND_PX && fabsf(errorY) <= TRACK_DEADBAND_PX) {
+    return;
+  }
+
+  float servo1Deg = lastServo1CommandDeg;
+  float servo4Deg = lastServo4CommandDeg;
+
+  if (isnan(servo1Deg)) servo1Deg = readPositionServoDeg(1);
+  if (isnan(servo4Deg)) servo4Deg = readPositionServoDeg(4);
+  if (isnan(servo1Deg) || isnan(servo4Deg)) return;
+
+  if (fabsf(errorX) > TRACK_DEADBAND_PX) {
+    servo1Deg += limitedStep(trackServo1Sign * errorX * TRACK_KP_DEG_PER_PIXEL);
+  }
+
+  if (fabsf(errorY) > TRACK_DEADBAND_PX) {
+    servo4Deg += limitedStep(trackServo4Sign * errorY * TRACK_KP_DEG_PER_PIXEL);
+  }
+
+  servo1Deg = constrain(servo1Deg, SERVO1_MIN_DEG, SERVO1_MAX_DEG);
+  servo4Deg = constrain(servo4Deg, effectiveServoMinDeg(4), effectiveServoMaxDeg(4));
+
+  commandPositionServo(1, servo1Deg, TRACK_SERVO_SPEED, TRACK_SERVO_ACC, false);
+  commandPositionServo(4, servo4Deg, TRACK_SERVO_SPEED, TRACK_SERVO_ACC, false);
+
+  if (!streamMode && millis() - lastTrackingPrintMs > TRACK_PRINT_INTERVAL_MS) {
+    lastTrackingPrintMs = millis();
+    Serial.printf(
+      "TRACK | hotspot x=%.1f y=%.1f | err x=%.1f y=%.1f | servo1=%.1f servo4=%.1f\n",
+      hotspot.x,
+      hotspot.y,
+      errorX,
+      errorY,
+      servo1Deg,
+      servo4Deg
+    );
+  }
+}
+
+// ============================================================
+// KALIBRIERUNG / AUSGABE
+// ============================================================
+void saveCalibration() {
+  prefs.begin("joint", false);
+  prefs.putInt("potMin", potMinRaw);
+  prefs.putInt("potMax", potMaxRaw);
+  prefs.putFloat("degMin", jointMinDeg);
+  prefs.putFloat("degMax", jointMaxDeg);
+  prefs.putInt("dir", servoDirection);
+  prefs.putInt("track1", trackServo1Sign);
+  prefs.putInt("track4", trackServo4Sign);
+  prefs.end();
+  Serial.println("Kalibrierung gespeichert.");
+}
+
+void loadCalibration() {
+  prefs.begin("joint", true);
+  potMinRaw = prefs.getInt("potMin", potMinRaw);
+  potMaxRaw = prefs.getInt("potMax", potMaxRaw);
+  jointMinDeg = prefs.getFloat("degMin", jointMinDeg);
+  jointMaxDeg = prefs.getFloat("degMax", jointMaxDeg);
+  servoDirection = prefs.getInt("dir", servoDirection);
+  trackServo1Sign = prefs.getInt("track1", trackServo1Sign);
+  trackServo4Sign = prefs.getInt("track4", trackServo4Sign);
+  prefs.end();
+}
+
+void printPositionServoStatus(uint8_t id) {
+  float deg = readPositionServoDeg(id);
+  int pos = st.ReadPos(id);
+
+  Serial.print("Servo ");
+  Serial.print(id);
+  Serial.print(": pos=");
+  Serial.print(pos);
+  Serial.print(" angle=");
+  if (isnan(deg)) Serial.print("?");
+  else Serial.print(deg, 2);
+
+  Serial.print(" deg limit[");
+  Serial.print(effectiveServoMinDeg(id), 1);
+  Serial.print(", ");
+  Serial.print(effectiveServoMaxDeg(id), 1);
+  Serial.println("]");
+}
+
+void printStatus() {
+  int raw = readPotRawAveraged(16);
+  float deg = rawToJointDegUnclamped(raw);
+
+  Serial.print("Servo2 Poti raw=");
+  Serial.print(raw);
+  Serial.print(" Winkel=");
+  Serial.print(deg, 3);
+  Serial.print(" deg Bereich raw[");
+  Serial.print(potMinRaw);
+  Serial.print(", ");
+  Serial.print(potMaxRaw);
+  Serial.print("] deg[");
+  Serial.print(jointMinDeg, 3);
+  Serial.print(", ");
+  Serial.print(jointMaxDeg, 3);
+  Serial.print("] kp=");
+  Serial.print(kp, 2);
+  Serial.print(" minSpeed=");
+  Serial.print(minSpeed);
+  Serial.print(" maxSpeed=");
+  Serial.print(maxSpeed);
+  Serial.print(" acc=");
+  Serial.print(activeAcc);
+  Serial.print(" dir=");
+  Serial.print(servoDirection);
+  Serial.print(" emergency=");
+  Serial.println(emergencyLatched ? "JA" : "nein");
+
+  Serial.print("Tracking=");
+  Serial.print(trackingActive ? "AN" : "AUS");
+  Serial.print(" trackServo1Sign=");
+  Serial.print(trackServo1Sign);
+  Serial.print(" trackServo4Sign=");
+  Serial.println(trackServo4Sign);
+
+  for (uint8_t i = 0; i < POSITION_SERVO_COUNT; i++) {
+    printPositionServoStatus(POSITION_SERVOS[i].id);
+  }
+}
+
+void printReadServo(uint8_t id) {
+  Serial.print("Servo ");
+  Serial.print(id);
+  Serial.print(" Ping: ");
+  Serial.println(st.Ping(id));
+  Serial.print("Mode: ");
+  Serial.println(st.ReadMode(id));
+  Serial.print("Pos: ");
+  Serial.println(st.ReadPos(id));
+  Serial.print("Speed: ");
+  Serial.println(st.ReadSpeed(id));
+  Serial.print("Voltage: ");
+  Serial.println(st.ReadVoltage(id));
+  Serial.print("Temp: ");
+  Serial.println(st.ReadTemper(id));
+}
+
+void printReadAll() {
+  printReadServo(1);
+  printReadServo(2);
+  printReadServo(3);
+  printReadServo(4);
+}
+
+void printHelp() {
+  Serial.println();
+  Serial.println("Befehle:");
+  Serial.println("  STREAM              Kamera-Viewer/Binaerstream aktivieren");
+  Serial.println("  TEXT                Textdiagnose aktivieren");
+  Serial.println("  RESETCAM            Kamera neu starten");
+  Serial.println("  track start         Hotspot-Tracking starten");
+  Serial.println("  track stop          Hotspot-Tracking stoppen");
+  Serial.println("  track status        Tracking-Status anzeigen");
+  Serial.println("  trackdir1 1/-1      Richtung Servo 1 Tracking umkehren");
+  Serial.println("  trackdir4 1/-1      Richtung Servo 4 Tracking umkehren");
+  Serial.println("  status              Poti/Winkel/Grenzen fuer alle Servos");
+  Serial.println("  read                Servo-Werte aller Servos lesen");
+  Serial.println("  read 3              Servo-Werte eines Servos lesen");
+  Serial.println("  raw                 Poti-Rohwerte streamen");
+  Serial.println("  setmin              aktuellen Poti-Wert als unteren Rand Servo 2 setzen");
+  Serial.println("  setmax              aktuellen Poti-Wert als oberen Rand Servo 2 setzen");
+  Serial.println("  range 0 125         Winkelbereich Servo 2 setzen");
+  Serial.println("  save                Kalibrierung speichern");
+  Serial.println("  mode                Servo 2 in Geschwindigkeitsmodus setzen");
+  Serial.println("  posmode 1           Servo 1, 3 oder 4 in Positionsmodus setzen");
+  Serial.println("  posmode all         Servo 1, 3 und 4 in Positionsmodus setzen");
+  Serial.println("  go 75               Servo 2 per Poti-Regelung auf Winkel fahren");
+  Serial.println("  rel 10              Servo 2 relativ bewegen");
+  Serial.println("  servo 1 180         Servo 1: 135..225 deg");
+  Serial.println("  servo 3 320         Servo 3: 100..335 deg");
+  Serial.println("  servo 4 120         Servo 4: 90..270 deg, bei Servo3 300..335 nur 170..270");
+  Serial.println("  stop / s            Tracking stoppen und alle Servos stoppen");
+  Serial.println("  clear               Not-Stopp entsperren");
+  Serial.println("  kp 18               Reglerstaerke Servo 2 setzen");
+  Serial.println("  minspeed 35         Mindestgeschwindigkeit Servo 2");
+  Serial.println("  maxspeed 1500       Maximalgeschwindigkeit Servo 2");
+  Serial.println("  acc 0               Beschleunigung Servo 2");
+  Serial.println("  tol 0.7             Ziel-Toleranz Servo 2 in Grad");
+  Serial.println("  dir 1 / dir -1      Richtung Servo 2 setzen");
+  Serial.println();
+}
+
+// ============================================================
+// KOMMANDOS
+// ============================================================
+void handleCommand(String cmd) {
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  String upper = cmd;
+  upper.toUpperCase();
+
+  if (upper == "STREAM") {
+    streamMode = true;
+    Serial.println("INFO binary stream enabled");
+
+  } else if (upper == "TEXT") {
+    streamMode = false;
+    Serial.println("INFO text diagnostic mode enabled");
+
+  } else if (upper == "RESETCAM") {
+    streamMode = false;
+    cameraConfigured = false;
+    Serial.println("INFO camera reset requested");
+
+  } else if (cmd == "help") {
+    printHelp();
+
+  } else if (cmd == "status") {
+    printStatus();
+
+  } else if (cmd == "read") {
+    printReadAll();
+
+  } else if (cmd.startsWith("read ")) {
+    int id;
+    if (sscanf(cmd.c_str(), "read %d", &id) == 1 && id >= 1 && id <= 4) {
+      printReadServo(uint8_t(id));
+    } else {
+      Serial.println("Format: read 1");
+    }
+
+  } else if (cmd == "raw") {
+    uint32_t started = millis();
+    while (millis() - started < 5000) {
+      Serial.println(readPotRawAveraged(8));
+      delay(100);
+    }
+
+  } else if (cmd == "setmin") {
+    potMinRaw = readPotRawAveraged(80);
+    Serial.print("potMinRaw = ");
+    Serial.println(potMinRaw);
+
+  } else if (cmd == "setmax") {
+    potMaxRaw = readPotRawAveraged(80);
+    Serial.print("potMaxRaw = ");
+    Serial.println(potMaxRaw);
+
+  } else if (cmd.startsWith("range ")) {
+    float a, b;
+    if (sscanf(cmd.c_str(), "range %f %f", &a, &b) == 2 && b > a) {
+      jointMinDeg = a;
+      jointMaxDeg = b;
+      Serial.println("Servo 2 Winkelbereich gesetzt.");
+      printStatus();
+    } else {
+      Serial.println("Format: range 0 125");
+    }
+
+  } else if (cmd == "save") {
+    saveCalibration();
+
+  } else if (cmd == "mode") {
+    setServo2VelocityMode();
+
+  } else if (cmd == "posmode all") {
+    setPositionMode(1);
+    setPositionMode(3);
+    setPositionMode(4);
+
+  } else if (cmd.startsWith("posmode ")) {
+    int id;
+    if (sscanf(cmd.c_str(), "posmode %d", &id) == 1) {
+      setPositionMode(uint8_t(id));
+    } else {
+      Serial.println("Format: posmode 1");
+    }
+
+  } else if (cmd == "track start") {
+    startTracking();
+
+  } else if (cmd == "track stop") {
+    stopTrackingOnly();
+
+  } else if (cmd == "track status") {
+    printStatus();
+
+  } else if (cmd.startsWith("trackdir1 ")) {
+    int v;
+    if (sscanf(cmd.c_str(), "trackdir1 %d", &v) == 1 && (v == 1 || v == -1)) {
+      trackServo1Sign = v;
+      Serial.print("trackServo1Sign = ");
+      Serial.println(trackServo1Sign);
+    } else {
+      Serial.println("Format: trackdir1 1 oder trackdir1 -1");
+    }
+
+  } else if (cmd.startsWith("trackdir4 ")) {
+    int v;
+    if (sscanf(cmd.c_str(), "trackdir4 %d", &v) == 1 && (v == 1 || v == -1)) {
+      trackServo4Sign = v;
+      Serial.print("trackServo4Sign = ");
+      Serial.println(trackServo4Sign);
+    } else {
+      Serial.println("Format: trackdir4 1 oder trackdir4 -1");
+    }
+
+  } else if (cmd.startsWith("go ")) {
+    float target;
+    if (sscanf(cmd.c_str(), "go %f", &target) == 1) {
+      trackingActive = false;
+      moveToByPot(target);
+    } else {
+      Serial.println("Format: go 75");
+    }
+
+  } else if (cmd.startsWith("rel ")) {
+    float delta;
+    if (sscanf(cmd.c_str(), "rel %f", &delta) == 1) {
+      trackingActive = false;
+      moveRelativeByPot(delta);
+    } else {
+      Serial.println("Format: rel -10");
+    }
+
+  } else if (cmd.startsWith("servo ")) {
+    int id;
+    float target;
+    if (sscanf(cmd.c_str(), "servo %d %f", &id, &target) == 2) {
+      if (id == 1 || id == 4) {
+        trackingActive = false;
+      }
+      movePositionServo(uint8_t(id), target);
+    } else {
+      Serial.println("Format: servo 3 220");
+    }
+
+  } else if (cmd == "stop" || cmd == "s") {
+    stopAllServos();
+    Serial.println("Stop.");
+
+  } else if (cmd == "clear") {
+    emergencyLatched = false;
+    Serial.println("Not-Stopp entsperrt.");
+    printStatus();
+
+  } else if (cmd.startsWith("kp ")) {
+    float v;
+    if (sscanf(cmd.c_str(), "kp %f", &v) == 1) {
+      kp = constrain(v, 1.0f, 100.0f);
+      Serial.print("kp = ");
+      Serial.println(kp, 2);
+    }
+
+  } else if (cmd.startsWith("minspeed ")) {
+    int v;
+    if (sscanf(cmd.c_str(), "minspeed %d", &v) == 1) {
+      minSpeed = constrain(v, 1, maxSpeed);
+      Serial.print("minSpeed = ");
+      Serial.println(minSpeed);
+    }
+
+  } else if (cmd.startsWith("maxspeed ")) {
+    int v;
+    if (sscanf(cmd.c_str(), "maxspeed %d", &v) == 1) {
+      maxSpeed = constrain(v, minSpeed, 3000);
+      Serial.print("maxSpeed = ");
+      Serial.println(maxSpeed);
+    }
+
+  } else if (cmd.startsWith("acc ")) {
+    int v;
+    if (sscanf(cmd.c_str(), "acc %d", &v) == 1) {
+      activeAcc = constrain(v, 0, 254);
+      Serial.print("ACC = ");
+      Serial.println(activeAcc);
+    }
+
+  } else if (cmd.startsWith("tol ")) {
+    float v;
+    if (sscanf(cmd.c_str(), "tol %f", &v) == 1) {
+      toleranceDeg = constrain(v, 0.05f, 3.0f);
+      Serial.print("Toleranz = ");
+      Serial.println(toleranceDeg, 3);
+    }
+
+  } else if (cmd.startsWith("dir ")) {
+    int v;
+    if (sscanf(cmd.c_str(), "dir %d", &v) == 1 && (v == 1 || v == -1)) {
+      servoDirection = v;
+      Serial.print("Richtung = ");
+      Serial.println(servoDirection);
+    } else {
+      Serial.println("Format: dir 1 oder dir -1");
+    }
+
+  } else {
+    Serial.println("Unbekannter Befehl. Tippe: help");
+  }
+}
+
+void handleSerialCommands() {
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == '\n' || c == '\r') {
+      handleCommand(inputLine);
+      inputLine = "";
+    } else {
+      inputLine += c;
+    }
+  }
+}
+
+// ============================================================
+// SETUP / LOOP
+// ============================================================
+void setup() {
+  pinMode(PIN_RESET, OUTPUT);
+  pinMode(PIN_READY, INPUT);
+  pinMode(PIN_SS, OUTPUT);
+  digitalWrite(PIN_SS, HIGH);
+  digitalWrite(PIN_RESET, HIGH);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(POT_PIN, ADC_11db);
+
+  Serial.begin(SERIAL_BAUD);
+  delay(1200);
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("THERMAL TRACKING + ST3215 ROBOT ARM");
+  Serial.println("Baud: 921600");
+  Serial.println("Viewer: STREAM bleibt kompatibel");
+  Serial.println("Tracking: track start / track stop");
+  Serial.println("========================================");
+
+  Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setClock(100000);
+
+  SPI.begin(PIN_CLK, PIN_MISO, PIN_MOSI, PIN_SS);
+
+  Serial1.begin(SERVO_BAUD, SERIAL_8N1, SERVO_RX, SERVO_TX);
+  st.pSerial = &Serial1;
+
+  loadCalibration();
+
+  resetCamera();
+  delay(700);
+
+  cameraConfigured = configureCamera();
+  if (!cameraConfigured) {
+    Serial.println("ERR setup failed; check camera wiring and power");
+  }
+
+  printHelp();
+  printStatus();
+}
+
+void loop() {
+  handleSerialCommands();
+  periodicFailsafeCheck();
+
+  if (!cameraConfigured) {
+    if (millis() - lastConfigureAttemptMs > 2000) {
+      lastConfigureAttemptMs = millis();
+      Serial.println("RETRY camera setup");
+      resetCamera();
+      delay(700);
+      cameraConfigured = configureCamera();
+    }
+    return;
+  }
+
+  if (!streamMode && millis() - lastStatusReportMs > 2000) {
+    lastStatusReportMs = millis();
+    printStatusReport("LIVE STATUS");
+  }
+
+  if (!waitForFrameReady(1500)) {
+    Serial.println("FRAME ERROR | timeout waiting for DATA_READY; restarting stream");
+    printStatusReport("FRAME TIMEOUT DETAIL");
+    i2cWrite8(REG_FRAME_MODE, 0);
+    delay(50);
+    if (!i2cWrite8(REG_FRAME_MODE, FRAME_MODE_NO_HEADER | FRAME_MODE_CONTINUOUS)) {
+      Serial.println("CAMERA ERROR | stream restart failed; retrying camera setup");
+      cameraConfigured = false;
+    }
+    return;
+  }
+
+  uint16_t minValue = 0;
+  uint16_t maxValue = 0;
+  if (!readThermalFrame(minValue, maxValue)) {
+    Serial.println("FRAME ERROR | invalid min/max range from SPI data");
+    return;
+  }
+
+  const Hotspot hotspot = findHotspotCenter(maxValue);
+
+  updateThermalTracking(hotspot);
+
+  if (streamMode) {
+    normalizeFrame(minValue, maxValue);
+    applyRowBandCorrection();
+    sendFrame(minValue, maxValue, hotspot);
+  } else if (millis() - lastDiagnosticFrameMs > 500) {
+    lastDiagnosticFrameMs = millis();
+    printDiagnosticFrame(minValue, maxValue, hotspot);
+  }
+}
