@@ -1,0 +1,40 @@
+#include <ESP32Servo.h>
+
+#define SPRAY_SERVO_PIN 2
+
+Servo mySprayServo;
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialisierung des Spray-Servos
+  mySprayServo.setPeriodHertz(50);
+  mySprayServo.attach(SPRAY_SERVO_PIN, 500, 2400);
+  mySprayServo.write(90); 
+  
+  Serial.println("System bereit. Steuerung:");
+  Serial.println("'9' für 0°, '0' für 180°, 'H' für 90° (Home).");
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    char cmd = Serial.read(); 
+    
+    // Düsen-Steuerung
+    if (cmd == '9') {
+      mySprayServo.write(0);
+      Serial.println("Servo auf 0°");
+    }
+    
+    if (cmd == '0') {
+      mySprayServo.write(180);
+      Serial.println("Servo auf 180°");
+    }
+
+    // Home-Position (Taste H)
+    if (cmd == 'H' || cmd == 'h') {
+      mySprayServo.write(90);
+      Serial.println("Servo auf 90° (Home)");
+    }
+  }
+}
