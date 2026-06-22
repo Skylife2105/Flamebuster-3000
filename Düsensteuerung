@@ -20,21 +20,20 @@ void loop() {
   if (Serial.available() > 0) {
     char cmd = Serial.read(); 
     
-    // Düsen-Steuerung
+    // Düsen-Steuerung mit else if
     if (cmd == '9') {
       mySprayServo.write(0);
       Serial.println("Servo auf 0°");
     }
-    
-    if (cmd == '0') {
+    else if (cmd == '0') {
       mySprayServo.write(180);
       Serial.println("Servo auf 180°");
     }
-
-    // Home-Position (Taste H)
-    if (cmd == 'H' || cmd == 'h') {
+    else if (cmd == 'H' || cmd == 'h') {
       mySprayServo.write(90);
       Serial.println("Servo auf 90° (Home)");
     }
+    // Optional: Ignoriert Newline-Zeichen (\n oder \r) aus dem seriellen Monitor
   }
+}
 }
