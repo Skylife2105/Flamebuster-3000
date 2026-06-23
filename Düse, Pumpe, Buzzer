@@ -1,0 +1,113 @@
+#include <ESP32Servo.h>
+
+// --- PIN DEFINITIONEN ---
+const int SPRAY_SERVO_PIN = 5; // Servo auf GPIO 5 (Konflikt gelöst)
+const int buzzerPin = 18;       // Buzzer an GPIO 18
+const int potPin = 1;          // Potentiometer an GPIO 1 (ESP32-S3 ADC1)
+const int motorPinRPWM = 2;     // Pumpe an GPIO 2
+
+// --- PARAMETER ---
+const int resolution = 8;       // 8-Bit Auflösung für PWM
+unsigned long kickstartStartTime = 0;
+const unsigned long kickstartDuration = 500;
+bool isKickstarting = false;    // Status, ob der Kickstart gerade läuft
+
+// --- STATUS-VARIABLEN ---
+bool isRunning = false;         // Status der Pumpe
+Servo mySprayServo;
+
+void setup() {
+  Serial.begin(115200);
+
+  // 1. Initialisierung Servo
+  mySprayServo.setPeriodHertz(50);
+  mySprayServo.attach(SPRAY_SERVO_PIN, 500, 2400);
+  mySprayServo.write(90); // Start in Home-Position
+  
+  // 2. Initialisierung Buzzer
+  ledcAttach(buzzerPin, 1000, resolution);
+  ledcWrite(buzzerPin, 0);
+
+  // 3. Initialisierung Pumpe
+  ledcAttach(motorPinRPWM, 5000, resolution);
+  ledcWrite(motorPinRPWM, 0); // Sicherer Start (Aus)
+
+  Serial.println("=============================================");
+  Serial.println("Feuerlöschroboter System bereit!");
+  Serial.println("DÜSE:  '9' = 0°, '0' = 180°, 'H' = 90°");
+  Serial.println("PUMPE: '1' = Start (Kickstart), '2' = Stopp");
+  Serial.println("=============================================");
+}
+
+void loop() {
+  // --- SERIELLE BEFEHLE AUSWERTEN ---
+  if (Serial.available() > 0) {
+    char cmd = Serial.read(); 
+
+    // --- STRUKTUR 1: DÜSEN-STEUERUNG ---
+    bool validServoCmd = false;
+    if (cmd == '9') {
+      mySprayServo.write(0);
+      Serial.println("\nDüse auf 0° (Strahl) eingestellt.");
+      validServoCmd = true;
+    }
+    else if (cmd == '0') {
+      mySprayServo.write(180);
+      Serial.println("\nDüse auf 180° (Sprühnebel) eingestellt.");
+      validServoCmd = true;
+    }
+    else if (cmd == 'H' || cmd == 'h') {
+      mySprayServo.write(90);
+      Serial.println("\nDüse auf 90° (Home) eingestellt.");
+      validServoCmd = true;
+    }
+
+    // Wenn ein Düsenbefehl kam -> Bestätigungston abspielen
+    if (validServoCmd) {
+      ledcChangeFrequency(buzzerPin, 880, resolution); // Passend für Core 3.3.10
+      ledcWrite(buzzerPin, 128); // Lautstärke 50%
+      delay(150);                // Kurzer Piepston
+      ledcWrite(buzzerPin, 0);   // Ton aus
+      Serial.println("-> Bereit für Pumpenstart ('1' senden).");
+    }
+
+    // --- STRUKTUR 2: PUMPEN-STEUERUNG ---
+    if (cmd == '1') {
+      if (!isRunning) { // Nur starten, wenn sie nicht schon läuft
+        isRunning = true;
+        isKickstarting = true;
+        kickstartStartTime = millis(); // Zeit für non-blocking Kickstart merken
+        ledcWrite(motorPinRPWM, 255);  // Sofort Vollgas
+        Serial.println("\nPumpenstart: Kickstart aktiv...");
+      }
+    } 
+    else if (cmd == '2') {
+      isRunning = false;
+      isKickstarting = false;
+      ledcWrite(motorPinRPWM, 0);     // Pumpe sofort aus
+      Serial.println("\nPumpe GESTOPPT.");
+    }
+  }
+
+// --- DYNAMISCHE PUMPENSTEUERUNG (NON-BLOCKING) ---
+  if (isRunning) {
+    if (isKickstarting) {
+      // Prüfen, ob die 500 ms Kickstart vorbei sind
+      if (millis() - kickstartStartTime >= kickstartDuration) {
+        isKickstarting = false; // Kickstart beendet, wechsle zu Poti
+        Serial.println("Kickstart beendet. Dauerbetrieb via Poti aktiv.");
+      }
+      // Während des Kickstarts bleibt ledcWrite auf 255 (wird oben gesetzt)
+    } 
+    else {
+      // Normaler Dauerbetrieb: Poti auslesen & regeln
+      int potValue = analogRead(potPin);
+      int speed = map(potValue, 0, 4095, 0, 255); // 12-Bit ADC des S3 auf 8-Bit PWM
+      
+      // Mindestdrehzahl-Schutz gegen Brummen
+      if (speed < 40) speed = 40; 
+      
+      ledcWrite(motorPinRPWM, speed);
+    }
+  }
+}
