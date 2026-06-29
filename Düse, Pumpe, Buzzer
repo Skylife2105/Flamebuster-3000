@@ -1,10 +1,10 @@
 #include <ESP32Servo.h>
 
 // --- PIN DEFINITIONEN ---
-const int SPRAY_SERVO_PIN = 5; // Servo auf GPIO 5 (Konflikt gelöst)
+const int SPRAY_SERVO_PIN = 5; // Servo auf GPIO 5
 const int buzzerPin = 18;       // Buzzer an GPIO 18
-const int potPin = 1;          // Potentiometer an GPIO 1 (ESP32-S3 ADC1)
 const int motorPinRPWM = 2;     // Pumpe an GPIO 2
+// Hinweis: potPin an GPIO 1 wurde entfernt!
 
 // --- PARAMETER ---
 const int resolution = 8;       // 8-Bit Auflösung für PWM
@@ -33,9 +33,9 @@ void setup() {
   ledcWrite(motorPinRPWM, 0); // Sicherer Start (Aus)
 
   Serial.println("=============================================");
-  Serial.println("Feuerlöschroboter System bereit!");
+  Serial.println("Feuerlöschroboter System bereit! (Ohne Poti)");
   Serial.println("DÜSE:  '9' = 0°, '0' = 180°, 'H' = 90°");
-  Serial.println("PUMPE: '1' = Start (Kickstart), '2' = Stopp");
+  Serial.println("PUMPE: '1' = Start (Kickstart -> 50% Leistung), '2' = Stopp");
   Serial.println("=============================================");
 }
 
@@ -64,21 +64,21 @@ void loop() {
 
     // Wenn ein Düsenbefehl kam -> Bestätigungston abspielen
     if (validServoCmd) {
-      ledcChangeFrequency(buzzerPin, 880, resolution); // Passend für Core 3.3.10
-      ledcWrite(buzzerPin, 128); // Lautstärke 50%
-      delay(150);                // Kurzer Piepston
-      ledcWrite(buzzerPin, 0);   // Ton aus
+      ledcChangeFrequency(buzzerPin, 2700, resolution); // Maximale Lautstärke-Frequenz
+      ledcWrite(buzzerPin, 128);                        // 50% Square Wave
+      delay(150);                                       // Kurzer Piepston
+      ledcWrite(buzzerPin, 0);                          // Ton aus
       Serial.println("-> Bereit für Pumpenstart ('1' senden).");
     }
 
     // --- STRUKTUR 2: PUMPEN-STEUERUNG ---
     if (cmd == '1') {
-      if (!isRunning) { // Nur starten, wenn sie nicht schon läuft
+      if (!isRunning) { 
         isRunning = true;
         isKickstarting = true;
-        kickstartStartTime = millis(); // Zeit für non-blocking Kickstart merken
-        ledcWrite(motorPinRPWM, 255);  // Sofort Vollgas
-        Serial.println("\nPumpenstart: Kickstart aktiv...");
+        kickstartStartTime = millis(); // Startzeit für Kickstart merken
+        ledcWrite(motorPinRPWM, 255);  // Sofort 100% Leistung für den Anlauf
+        Serial.println("\nPumpenstart: Kickstart (100%) aktiv...");
       }
     } 
     else if (cmd == '2') {
@@ -89,25 +89,17 @@ void loop() {
     }
   }
 
-// --- DYNAMISCHE PUMPENSTEUERUNG (NON-BLOCKING) ---
+  // --- AUTOMATISCHE PUMPENSTEUERUNG (NON-BLOCKING) ---
   if (isRunning) {
     if (isKickstarting) {
       // Prüfen, ob die 500 ms Kickstart vorbei sind
       if (millis() - kickstartStartTime >= kickstartDuration) {
-        isKickstarting = false; // Kickstart beendet, wechsle zu Poti
-        Serial.println("Kickstart beendet. Dauerbetrieb via Poti aktiv.");
+        isKickstarting = false; // Kickstart beendet
+        // GEÄNDERT: Nach Ablauf starr auf 128 regeln (= 50% Dauerleistung)
+        ledcWrite(motorPinRPWM, 128); 
+        Serial.println("Kickstart beendet. Dauerbetrieb auf 50% Leistung aktiv.");
       }
-      // Während des Kickstarts bleibt ledcWrite auf 255 (wird oben gesetzt)
-    } 
-    else {
-      // Normaler Dauerbetrieb: Poti auslesen & regeln
-      int potValue = analogRead(potPin);
-      int speed = map(potValue, 0, 4095, 0, 255); // 12-Bit ADC des S3 auf 8-Bit PWM
-      
-      // Mindestdrehzahl-Schutz gegen Brummen
-      if (speed < 40) speed = 40; 
-      
-      ledcWrite(motorPinRPWM, speed);
+      // Während des Kickstarts bleibt ledcWrite auf 255 (wird oben beim Start gesetzt)
     }
   }
 }
