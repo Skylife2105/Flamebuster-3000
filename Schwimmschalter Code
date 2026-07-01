@@ -1,0 +1,37 @@
+// Definition des Pins für den Schwimmschalter
+const int SCHWIMMSCHALTER_PIN = 4; 
+
+// Variablen für den Status
+int letzterStatus = -1;
+
+void setup() {
+  // Seriellen Monitor starten
+  Serial.begin(115200);
+  
+  // Pin als Eingang mit internem Pull-Up-Widerstand definieren
+  pinMode(SCHWIMMSCHALTER_PIN, INPUT_PULLUP);
+  
+  Serial.println("ESP32-S3 Schwimmschalter-Überwachung gestartet...");
+}
+
+void loop() {
+  // Aktuellen Zustand einlesen (LOW = Kontakt geschlossen, HIGH = Kontakt offen)
+  int aktuellerStatus = digitalRead(SCHWIMMSCHALTER_PIN);
+
+  // Nur ausgeben, wenn sich der Status geändert hat
+  if (aktuellerStatus != letzterStatus) {
+    if (aktuellerStatus == LOW) {
+      Serial.println("Status geändert: Schalter AUSGELÖST (GND-Kontakt)");
+      // Hier kannst du Code einfügen, z.B. Pumpe ausschalten
+    } else {
+      Serial.println("Status geändert: Schalter OFFEN (Normalzustand)");
+      // Hier kannst du Code einfügen, z.B. Pumpe erlauben
+    }
+    
+    // Status aktualisieren
+    letzterStatus = aktuellerStatus;
+  }
+
+  // Kleine Verzögerung zur Entprellung bei unruhigem Wasser
+  delay(200);
+}
