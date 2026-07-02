@@ -1,8 +1,8 @@
 #include <ESP32Servo.h>
 
 // --- PIN DEFINITIONEN ---
-const int SPRAY_SERVO_PIN = 5; // Servo auf GPIO 5
-const int buzzerPin = 18;       // Buzzer an GPIO 18
+const int SPRAY_SERVO_PIN = 5; // Servo auf GPIO 47
+const int buzzerPin = 18;       // Buzzer an GPIO 21
 const int motorPinRPWM = 2;     // Pumpe an GPIO 2
 // Hinweis: potPin an GPIO 1 wurde entfernt!
 
